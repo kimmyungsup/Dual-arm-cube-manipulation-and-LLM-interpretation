@@ -1,0 +1,24 @@
+#!/usr/bin/env -S uv run python
+# -*- mode: python -*-
+import argparse, sys, socket
+
+par = argparse.ArgumentParser()
+par.add_argument('-i', default='127.0.0.1', help='ip address')
+par.add_argument('-p', default=6600, type=int, help='port number')
+arg, w = par.parse_known_args()
+
+sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+server_address = (arg.i, arg.p)
+
+if len(sys.argv) == 1: exit()
+
+msg = w[0]
+for i in w[1:]: msg += ' ' + i
+#print(msg)
+
+try:
+    sock.sendto(msg.encode(), server_address)
+
+finally:
+    sock.close()
+
