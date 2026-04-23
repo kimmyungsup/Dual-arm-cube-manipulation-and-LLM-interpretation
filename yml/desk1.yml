@@ -1,0 +1,13 @@
+#abstract: test environment
+#date: 
+
+bodies:
+  - name: root
+    contact:
+      - {type: box, pos: [0.5, 0, 0.57], param: [0.5, 1.0, 0.03], k: [50000, 100, 50]}
+
+  - name: obj1
+    joint: {type: free, parent: root, q0: [0.4, -0.1, 0.7, 0, 0, 0]}
+    com: {mass: 0.5, inertia: [sphere, 0.1]}
+    contact:
+      - {type: box, param: [0.1, 0.1, 0.1], k: [10000, 100, 100]}
