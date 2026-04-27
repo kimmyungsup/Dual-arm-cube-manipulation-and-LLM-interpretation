@@ -74,7 +74,12 @@ LLM_SPEC_PATH = os.path.join(SCRIPT_DIR, "robot_command_llm_brief.txt")
 
 
 
-def _run_cubenet_worker(detector_path: str, classifier_path: str):
+def _run_cubenet_worker(
+    detector_path: str,
+    classifier_path: str,
+    on_face_registered=None,
+    on_capture_completed=None,
+):
     """Background worker that imports and runs CubeNet face-guide mode."""
     try:
         import cubenet_with_face_guide as cubenet_module
@@ -86,7 +91,12 @@ def _run_cubenet_worker(detector_path: str, classifier_path: str):
         print("[INFO] CubeNet face-guide detection thread started")
         print(f"[INFO] detector_path   = {detector_path}")
         print(f"[INFO] classifier_path = {classifier_path}")
-        cubenet_module.main(detector_path, classifier_path)
+        cubenet_module.main(
+            detector_path,
+            classifier_path,
+            on_face_registered=on_face_registered,
+            on_capture_completed=on_capture_completed,
+        )
         print("[INFO] CubeNet face-guide detection thread finished")
     except Exception as e:
         print(f"[ERR] CubeNet face-guide runtime error: {e}")
@@ -95,6 +105,8 @@ def _run_cubenet_worker(detector_path: str, classifier_path: str):
 def start_cubenet_detection_if_needed(
     detector_path: str = CUBENET_DETECTOR_PATH,
     classifier_path: str = CUBENET_CLASSIFIER_PATH,
+    on_face_registered=None,
+    on_capture_completed=None,
 ):
     """Start CubeNet only once. If it is already running, do nothing."""
     global cubenet_thread
@@ -113,7 +125,7 @@ def start_cubenet_detection_if_needed(
 
         cubenet_thread = threading.Thread(
             target=_run_cubenet_worker,
-            args=(detector_path, classifier_path),
+            args=(detector_path, classifier_path, on_face_registered, on_capture_completed),
             daemon=True,
             name="CubeNetThread",
         )
@@ -1226,7 +1238,27 @@ def print_current_summary_for_scenario():
 
 def scenario_mode(sock):
     """Keyboard mode for scenario authoring and command example export."""
-    start_cubenet_detection_if_needed()
+    def on_face_registered(face_idx, face_name, color_names, progress, total_faces):
+        print(
+            f"[SCENARIO][CUBENET] registered face {face_name} (idx={face_idx}) "
+            f"{progress}/{total_faces} -> {color_names}"
+        )
+        print("[SCENARIO][CUBENET] running inter-face test grasp motions...")
+        run_named_grasp_preset(sock, "left_grasp_off", verbose=True, speed_scale=DEFAULT_SPEED_SCALE)
+        run_named_grasp_preset(sock, "right_grasp_on", verbose=True, speed_scale=DEFAULT_SPEED_SCALE)
+
+    def on_capture_completed(face_data_map, solution):
+        print("\n[SCENARIO][CUBENET] all 6 faces captured.")
+        print("[SCENARIO][CUBENET] captured cube face data:")
+        for face_name in ["U", "R", "F", "D", "L", "B"]:
+            colors = face_data_map.get(face_name)
+            print(f"  - {face_name}: {colors if colors else 'N/A'}")
+        print(f"[SCENARIO][CUBENET] cube manipulation sequence: {solution}")
+
+    start_cubenet_detection_if_needed(
+        on_face_registered=on_face_registered,
+        on_capture_completed=on_capture_completed,
+    )
 
     print_scenario_mode_help()
     print_current_summary_for_scenario()
