@@ -37,6 +37,7 @@ FACE_GUIDE = {
     4: {"face": "L", "center": "ORANGE", "up": "WHITE (Up)"},
     5: {"face": "B", "center": "BLUE",   "up": "WHITE (Up)"},
 }
+FACE_INDEX_TO_NAME = {idx: info["face"] for idx, info in FACE_GUIDE.items()}
 
 
 def get_next_face_index(cube: CubeInteractor):
@@ -85,7 +86,23 @@ def draw_face_guide(frame: np.ndarray, cube: CubeInteractor) -> np.ndarray:
     return frame
 
 
-def main(detector_path: str, classifier_path: str) -> None:
+def _face_colors_to_names(face_colors):
+    return [getattr(color, "name", str(color)) for color in face_colors]
+
+
+def _collect_face_data_map(cube: CubeInteractor):
+    face_data_map = {}
+    for face_idx in FACE_GUIDE_ORDER:
+        face_name = FACE_INDEX_TO_NAME.get(face_idx, str(face_idx))
+        face_colors = cube.faces[face_idx]
+        if face_colors is None:
+            face_data_map[face_name] = None
+        else:
+            face_data_map[face_name] = _face_colors_to_names(face_colors)
+    return face_data_map
+
+
+def main(detector_path: str, classifier_path: str, on_face_registered=None, on_capture_completed=None) -> None:
     classifier = KNNClassifier(classifier_path)
     detector = TFLiteDetector(detector_path)
 
@@ -182,12 +199,43 @@ def main(detector_path: str, classifier_path: str) -> None:
         top, left, bot, right = position
         colors = classifier.my_get_colors(colors_est)
 
+        previous_registered_count = sum(1 for f in cube.faces if f is not None)
         cube.register_face(colors, frame)
+        current_registered_count = sum(1 for f in cube.faces if f is not None)
+        if current_registered_count > previous_registered_count:
+            registered_face_idx = int(colors[4].value)
+            registered_face_name = FACE_INDEX_TO_NAME.get(registered_face_idx, str(registered_face_idx))
+            registered_colors = _face_colors_to_names(cube.faces[registered_face_idx])
+            print(
+                f"[GUIDE] Face confirmed: {registered_face_name} "
+                f"({current_registered_count}/6) -> {registered_colors}"
+            )
+            if callable(on_face_registered):
+                try:
+                    on_face_registered(
+                        registered_face_idx,
+                        registered_face_name,
+                        registered_colors,
+                        current_registered_count,
+                        6,
+                    )
+                except Exception as callback_error:
+                    print(f"[WARN] on_face_registered callback error: {callback_error}")
+
         if cube.is_solvable():
             solution = cube.solve()
+            face_data_map = _collect_face_data_map(cube)
             frame = draw_face_guide(frame, cube)
             webcam.show_frame(frame)
-            print(solution)
+            print("[GUIDE] All cube faces captured.")
+            for face_name in ["U", "R", "F", "D", "L", "B"]:
+                print(f"[GUIDE] {face_name}: {face_data_map.get(face_name)}")
+            print(f"[GUIDE] Cube manipulation sequence: {solution}")
+            if callable(on_capture_completed):
+                try:
+                    on_capture_completed(face_data_map, solution)
+                except Exception as callback_error:
+                    print(f"[WARN] on_capture_completed callback error: {callback_error}")
             break
 
         try:
