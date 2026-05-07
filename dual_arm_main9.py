@@ -192,6 +192,11 @@ SRV_ADDR = (DEFAULT_UDP_HOST, 6600)
 pos_step = 0.01   # [m]
 rpy_step = 0.05   # [rad]
 
+# Arm teleoperation rotation frame.
+# "tool" preserves the legacy behavior by incrementing RPY components directly.
+# "base" applies roll/pitch/yaw increments around the robot base X/Y/Z axes.
+arm_rotation_frame = "tool"
+
 # Hand teleoperation step sizes.
 hand_step = 0.08       # [rad] for grouped finger motion
 thumb_joint_step = 0.05  # [rad] for per-selected-finger joint motion
@@ -413,11 +418,102 @@ def move_task(arm: str, axis: str, delta: float):
         right_task[idx] += delta
 
 
+def rotation_matrix_from_rpy(roll: float, pitch: float, yaw: float):
+    """Build a rotation matrix from roll/pitch/yaw using Rz(yaw) @ Ry(pitch) @ Rx(roll)."""
+    cr, sr = np.cos(roll), np.sin(roll)
+    cp, sp = np.cos(pitch), np.sin(pitch)
+    cy, sy = np.cos(yaw), np.sin(yaw)
+
+    rx = np.array([
+        [1.0, 0.0, 0.0],
+        [0.0, cr, -sr],
+        [0.0, sr, cr],
+    ], dtype=np.float64)
+    ry = np.array([
+        [cp, 0.0, sp],
+        [0.0, 1.0, 0.0],
+        [-sp, 0.0, cp],
+    ], dtype=np.float64)
+    rz = np.array([
+        [cy, -sy, 0.0],
+        [sy, cy, 0.0],
+        [0.0, 0.0, 1.0],
+    ], dtype=np.float64)
+    return rz @ ry @ rx
+
+
+def rpy_from_rotation_matrix(rot):
+    """Extract roll/pitch/yaw from a rotation matrix using Rz(yaw) @ Ry(pitch) @ Rx(roll)."""
+    pitch = np.arcsin(np.clip(-rot[2, 0], -1.0, 1.0))
+    cp = np.cos(pitch)
+
+    if abs(cp) > 1e-6:
+        roll = np.arctan2(rot[2, 1], rot[2, 2])
+        yaw = np.arctan2(rot[1, 0], rot[0, 0])
+    else:
+        roll = 0.0
+        yaw = np.arctan2(-rot[0, 1], rot[1, 1])
+
+    return np.array([roll, pitch, yaw], dtype=np.float32)
+
+
+def axis_rotation_matrix(axis: str, delta: float):
+    """Build a base-axis rotation matrix for roll(X), pitch(Y), or yaw(Z)."""
+    c, s = np.cos(delta), np.sin(delta)
+    if axis in ("roll", "rx"):
+        return np.array([
+            [1.0, 0.0, 0.0],
+            [0.0, c, -s],
+            [0.0, s, c],
+        ], dtype=np.float64)
+    if axis in ("pitch", "ry"):
+        return np.array([
+            [c, 0.0, s],
+            [0.0, 1.0, 0.0],
+            [-s, 0.0, c],
+        ], dtype=np.float64)
+    if axis in ("yaw", "rz"):
+        return np.array([
+            [c, -s, 0.0],
+            [s, c, 0.0],
+            [0.0, 0.0, 1.0],
+        ], dtype=np.float64)
+    raise ValueError("rotation axis must be one of roll,pitch,yaw (or rx,ry,rz)")
+
+
+def move_task_rotation(arm: str, axis: str, delta: float):
+    """Increment task rotation in either legacy tool-frame mode or base-frame mode."""
+    if arm_rotation_frame == "tool":
+        move_task(arm, axis, delta)
+        return
+    if arm_rotation_frame != "base":
+        raise ValueError("arm_rotation_frame must be 'tool' or 'base'")
+    if arm not in ("l", "r"):
+        raise ValueError("arm must be 'l' or 'r'")
+
+    target = left_task if arm == "l" else right_task
+    current_rot = rotation_matrix_from_rpy(float(target[3]), float(target[4]), float(target[5]))
+    base_delta_rot = axis_rotation_matrix(axis, delta)
+    target[3:6] = rpy_from_rotation_matrix(base_delta_rot @ current_rot)
+
+
+def set_arm_rotation_frame(frame: str):
+    global arm_rotation_frame
+    if frame not in ("tool", "base"):
+        raise ValueError("rotation frame must be 'tool' or 'base'")
+    arm_rotation_frame = frame
+
+
+def toggle_arm_rotation_frame():
+    global arm_rotation_frame
+    arm_rotation_frame = "base" if arm_rotation_frame == "tool" else "tool"
+
+
 def print_task_target():
     print("[Current task target]")
     print("  Left :", " ".join(f"{x:.5f}" for x in left_task))
     print("  Right:", " ".join(f"{x:.5f}" for x in right_task))
-    print(f"  step(pos)={pos_step:.5f} m, step(rpy)={rpy_step:.5f} rad")
+    print(f"  step(pos)={pos_step:.5f} m, step(rpy)={rpy_step:.5f} rad, rotation_frame={arm_rotation_frame}")
 
 
 # =============================================================================
@@ -908,6 +1004,7 @@ def print_arm_teleop_help():
     print(
         f"""
 [ARM TELEOP MODE]  (press 'm' again to exit)
+rotation_frame = {arm_rotation_frame}
 
 Left arm translation
   w/s : +x / -x
@@ -932,6 +1029,7 @@ Right arm rotation
 Other controls
   z/x : decrease/increase position step ({pos_step:.5f} m current)
   c/v : decrease/increase rotation step ({rpy_step:.5f} rad current)
+  \\  : toggle rotation frame (tool/base)
   b   : record current scenario snapshot
   1   : send init
   2   : send rest
@@ -959,17 +1057,17 @@ def teleop_key_action(sock, key: str):
     elif key == "f":
         move_task("l", "z", -pos_step)
     elif key == "t":
-        move_task("l", "roll", +rpy_step)
+        move_task_rotation("l", "roll", +rpy_step)
     elif key == "g":
-        move_task("l", "roll", -rpy_step)
+        move_task_rotation("l", "roll", -rpy_step)
     elif key == "y":
-        move_task("l", "pitch", +rpy_step)
+        move_task_rotation("l", "pitch", +rpy_step)
     elif key == "h":
-        move_task("l", "pitch", -rpy_step)
+        move_task_rotation("l", "pitch", -rpy_step)
     elif key == "u":
-        move_task("l", "yaw", +rpy_step)
+        move_task_rotation("l", "yaw", +rpy_step)
     elif key == "j":
-        move_task("l", "yaw", -rpy_step)
+        move_task_rotation("l", "yaw", -rpy_step)
     elif key == "i":
         move_task("r", "x", +pos_step)
     elif key == "k":
@@ -983,17 +1081,17 @@ def teleop_key_action(sock, key: str):
     elif key == ";":
         move_task("r", "z", -pos_step)
     elif key == "7":
-        move_task("r", "roll", +rpy_step)
+        move_task_rotation("r", "roll", +rpy_step)
     elif key == "4":
-        move_task("r", "roll", -rpy_step)
+        move_task_rotation("r", "roll", -rpy_step)
     elif key == "8":
-        move_task("r", "pitch", +rpy_step)
+        move_task_rotation("r", "pitch", +rpy_step)
     elif key == "5":
-        move_task("r", "pitch", -rpy_step)
+        move_task_rotation("r", "pitch", -rpy_step)
     elif key == "9":
-        move_task("r", "yaw", +rpy_step)
+        move_task_rotation("r", "yaw", +rpy_step)
     elif key == "6":
-        move_task("r", "yaw", -rpy_step)
+        move_task_rotation("r", "yaw", -rpy_step)
     elif key == "z":
         pos_step = max(0.001, pos_step * 0.5)
         print(f"\n[INFO] pos_step -> {pos_step:.5f} m")
@@ -1009,6 +1107,10 @@ def teleop_key_action(sock, key: str):
     elif key == "v":
         rpy_step = min(1.0, rpy_step * 2.0)
         print(f"\n[INFO] rpy_step -> {rpy_step:.5f} rad")
+        return None
+    elif key == "\\":
+        toggle_arm_rotation_frame()
+        print(f"\n[INFO] arm_rotation_frame -> {arm_rotation_frame}")
         return None
     elif key == "b":
         record_snapshot("arm_teleop")
@@ -1035,7 +1137,8 @@ def teleop_key_action(sock, key: str):
 
     send_current_task_rate_limited(sock, verbose=False)
     sys.stdout.write(
-        f"\r[L] xyz=({left_task[0]: .3f}, {left_task[1]: .3f}, {left_task[2]: .3f}) "
+        f"\r[rot={arm_rotation_frame}] "
+        f"[L] xyz=({left_task[0]: .3f}, {left_task[1]: .3f}, {left_task[2]: .3f}) "
         f"rpy=({left_task[3]: .3f}, {left_task[4]: .3f}, {left_task[5]: .3f}) | "
         f"[R] xyz=({right_task[0]: .3f}, {right_task[1]: .3f}, {right_task[2]: .3f}) "
         f"rpy=({right_task[3]: .3f}, {right_task[4]: .3f}, {right_task[5]: .3f})   "
@@ -2139,6 +2242,9 @@ def print_help():
   step <pos_step_m> <rpy_step_rad>
       Update task teleop step sizes
 
+  rotframe [tool|base]
+      Print or select the arm teleop rotation frame
+
   handstep <group_step_rad> <selected_finger_joint_step_rad>
       Update hand teleop step sizes
 
@@ -2339,6 +2445,15 @@ def main():
                 pos_step = float(tokens[1])
                 rpy_step = float(tokens[2])
                 print(f"[INFO] updated task step sizes -> pos: {pos_step:.5f} m, rpy: {rpy_step:.5f} rad")
+            elif cmd == "rotframe":
+                if len(tokens) == 1:
+                    print(f"[INFO] arm_rotation_frame = {arm_rotation_frame}")
+                    continue
+                if len(tokens) != 2:
+                    print("[ERR] rotframe command format: rotframe [tool|base]")
+                    continue
+                set_arm_rotation_frame(tokens[1].lower())
+                print(f"[INFO] arm_rotation_frame -> {arm_rotation_frame}")
             elif cmd == "handstep":
                 global hand_step, thumb_joint_step
                 if len(tokens) != 3:
