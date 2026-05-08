@@ -14,6 +14,8 @@ Valid examples:
 "ready"
 "left_grasp_on"
 "right_grasp_off"
+"lg"
+"rr"
 "task 0.30000 0.25000 -0.40000 0.00000 0.00000 0.00000 0.30000 -0.25000 -0.40000 0.00000 0.00000 0.00000"
 "none, joint 0.00000 0.00000 0.00000 0.00000 0.00000 0.00000 0.00000 0.00000 0.00000 0.00000 0.00000 0.00000 0.00000 0.00000 0.00000 0.00000 0.00000 0.00000 0.00000 0.00000, joint 0.00000 0.00000 0.00000 0.00000 0.00000 0.00000 0.00000 0.00000 0.00000 0.00000 0.00000 0.00000 0.00000 0.00000 0.00000 0.00000 0.00000 0.00000 0.00000 0.00000"
 
@@ -26,7 +28,24 @@ Allowed commands
 - "ready"
 - "quit"
 
-2) Grasp preset commands (high priority)
+2) Ready-based hand-only grasp/release commands (highest priority for normal grasp/release)
+- "lg" = left grasp
+- "lr" = left release
+- "rg" = right grasp
+- "rr" = right release
+
+Meaning:
+- These commands move only the hand joints and leave both arm targets unchanged.
+- Grasp starts from the stored ready hand pose and applies grouped flex 3 times.
+- Release returns that hand to the stored ready hand pose.
+
+Mapping rules:
+- "왼손 잡아" / "왼손 파지" → "lg"
+- "왼손 놓아" / "왼손 복귀" → "lr"
+- "오른손 잡아" / "오른손 파지" → "rg"
+- "오른손 놓아" / "오른손 복귀" → "rr"
+
+3) Distal grasp preset commands (use only when distal-only/finger-tip grasp is explicitly requested)
 - "left_grasp_on"
 - "left_grasp_off"
 - "right_grasp_on"
@@ -34,15 +53,9 @@ Allowed commands
 
 Meaning:
 - These commands control only the distal 2 joints of each finger.
-- They are used for precise grasping instead of full-hand closing.
+- They are used for precise distal grasping instead of ready-based grouped grasping.
 
-Mapping rules:
-- "왼손 잡아" → "left_grasp_on"
-- "왼손 놓아" → "left_grasp_off"
-- "오른손 잡아" → "right_grasp_on"
-- "오른손 놓아" → "right_grasp_off"
-
-3) Dual-arm task command
+4) Dual-arm task command
 - Format:
   "task <Lx Ly Lz Lroll Lpitch Lyaw Rx Ry Rz Rroll Rpitch Ryaw>"
 - Must contain exactly 12 floats.
@@ -50,14 +63,15 @@ Mapping rules:
   - position: meter
   - rotation: radian
 
-4) Dual-hand joint command
+5) Dual-hand joint command
 - Format:
   "none, joint <20 floats>, joint <20 floats>"
 - Must contain exactly 20 floats for left hand and 20 floats for right hand.
 
 Priority rules
-- If the request is about grasping/releasing, ALWAYS use grasp preset commands.
-- Do NOT generate joint arrays when a grasp preset can be used.
+- If the request is about normal grasping/releasing, ALWAYS use lg/lr/rg/rr.
+- Use distal grasp preset commands only when the user explicitly asks for distal-only or fingertip-specific grasping.
+- Do NOT generate joint arrays when lg/lr/rg/rr or a grasp preset can be used.
 
 State handling
 - The program will provide the current robot state.
