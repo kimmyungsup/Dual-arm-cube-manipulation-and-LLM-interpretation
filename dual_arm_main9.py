@@ -70,7 +70,7 @@ VOICE_DEVICE = os.environ.get("VOICE_DEVICE")
 VOICE_LANGUAGE_MODE = os.environ.get("VOICE_LANGUAGE_MODE", "en").lower()  # "en" | "ko" | "auto"
 VOICE_CONTINUOUS_MODE = False
 VOICE_CONFIRM_MODE = False
-LLM_SPEC_PATH = os.path.join(SCRIPT_DIR, "robot_command_llm_brief.txt")
+LLM_SPEC_PATH = os.path.join(SCRIPT_DIR, "robot_command_llm_brief_with_grasp.txt")
 
 
 
@@ -200,6 +200,7 @@ arm_rotation_frame = "tool"
 # Hand teleoperation step sizes.
 hand_step = 0.08       # [rad] for grouped finger motion
 thumb_joint_step = 0.05  # [rad] for per-selected-finger joint motion
+READY_GRASP_GROUPED_FLEX_COUNT = 3
 
 # Default command speed scaling.
 # Each callable command can override this through its own speed_scale argument.
@@ -673,6 +674,12 @@ RIGHT_DISTAL_GRASP_ON = np.array(
     [0.80, 0.80, 0.85, 0.85, 0.85, 0.85, 0.85, 0.85, 0.85, 0.85],
     dtype=np.float32,
 )
+DISTAL_GRASP_PRESET_ACTIONS = {
+    "left_grasp_on": ("left", True),
+    "left_grasp_off": ("left", False),
+    "right_grasp_on": ("right", True),
+    "right_grasp_off": ("right", False),
+}
 
 
 def set_hand_distal_grasp_preset(side: str, on: bool):
@@ -709,16 +716,10 @@ def run_named_grasp_preset(sock, name: str, verbose: bool = True, speed_scale: f
     - right_grasp_on
     - right_grasp_off
     """
-    mapping = {
-        "left_grasp_on": ("left", True),
-        "left_grasp_off": ("left", False),
-        "right_grasp_on": ("right", True),
-        "right_grasp_off": ("right", False),
-    }
-    if name not in mapping:
+    if name not in DISTAL_GRASP_PRESET_ACTIONS:
         raise ValueError(f"unknown grasp preset: {name}")
 
-    side, on = mapping[name]
+    side, on = DISTAL_GRASP_PRESET_ACTIONS[name]
     set_hand_distal_grasp_preset(side, on)
 
     if verbose:
@@ -726,6 +727,87 @@ def run_named_grasp_preset(sock, name: str, verbose: bool = True, speed_scale: f
 
     send_current_hand(sock, verbose=verbose)
     scaled_sleep(0.02, speed_scale)
+
+
+READY_HAND_ACTIONS = {
+    "lg": ("left", True, "left grasp"),
+    "lr": ("left", False, "left release"),
+    "rg": ("right", True, "right grasp"),
+    "rr": ("right", False, "right release"),
+}
+
+
+def apply_grouped_flex_to_hand_pose(side: str, hand_pose, step: float, count: int = READY_GRASP_GROUPED_FLEX_COUNT):
+    """Return a hand pose after applying z-style grouped flex several times."""
+    if side not in ("left", "right"):
+        raise ValueError("side must be 'left' or 'right'")
+
+    target = np.array(hand_pose, dtype=np.float32).copy()
+    delta = float(step) * int(count)
+
+    for finger in ("index", "middle", "ring", "little"):
+        target[FINGER_SLICES[finger]] += delta
+
+    thumb_delta = (-delta if side == "left" else delta)
+    thumb_base = FINGER_SLICES["thumb"].start
+    target[thumb_base + 2] += thumb_delta
+    target[thumb_base + 3] += thumb_delta
+    return target
+
+
+def set_ready_hand_action_target(
+    side: str,
+    grasp: bool,
+    path: str = READY_CSV_PATH,
+    step: float = None,
+    count: int = READY_GRASP_GROUPED_FLEX_COUNT,
+):
+    """Set one hand to ready release or ready + grouped-flex grasp while leaving arms untouched."""
+    global left_hand_target, right_hand_target
+
+    state = load_ready_state_from_csv(path)
+    if state is None:
+        return False
+
+    ready_key = f"{side}_hand_target"
+    ready_hand = state[ready_key].copy()
+    if grasp:
+        next_hand = apply_grouped_flex_to_hand_pose(
+            side,
+            ready_hand,
+            hand_step if step is None else step,
+            count=count,
+        )
+    else:
+        next_hand = ready_hand
+
+    if side == "left":
+        left_hand_target = next_hand
+    elif side == "right":
+        right_hand_target = next_hand
+    else:
+        raise ValueError("side must be 'left' or 'right'")
+
+    return True
+
+
+def run_ready_hand_action(sock, action: str, verbose: bool = True, speed_scale: float = DEFAULT_SPEED_SCALE):
+    """Run lg/lr/rg/rr ready-based hand-only grasp/release actions."""
+    if action not in READY_HAND_ACTIONS:
+        raise ValueError(f"unknown ready hand action: {action}")
+
+    side, grasp, label = READY_HAND_ACTIONS[action]
+    ok = set_ready_hand_action_target(side, grasp)
+    if not ok:
+        return False
+
+    if verbose:
+        mode = "ready + grouped flex x3" if grasp else "ready hand pose"
+        print(f"[INFO] {label} ({action}) -> {mode}; arm targets unchanged")
+
+    send_current_hand(sock, verbose=verbose)
+    scaled_sleep(0.02, speed_scale)
+    return True
 
 
 # =============================================================================
@@ -1030,6 +1112,10 @@ Other controls
   z/x : decrease/increase position step ({pos_step:.5f} m current)
   c/v : decrease/increase rotation step ({rpy_step:.5f} rad current)
   \\  : toggle rotation frame (tool/base)
+  L   : lg, left ready-based grasp (hand only)
+  O   : lr, left ready-based release (hand only)
+  R   : rg, right ready-based grasp (hand only)
+  P   : rr, right ready-based release (hand only)
   b   : record current scenario snapshot
   1   : send init
   2   : send rest
@@ -1111,6 +1197,22 @@ def teleop_key_action(sock, key: str):
     elif key == "\\":
         toggle_arm_rotation_frame()
         print(f"\n[INFO] arm_rotation_frame -> {arm_rotation_frame}")
+        return None
+    elif key == "L":
+        if run_ready_hand_action(sock, "lg", verbose=True):
+            print_hand_target("left")
+        return None
+    elif key == "O":
+        if run_ready_hand_action(sock, "lr", verbose=True):
+            print_hand_target("left")
+        return None
+    elif key == "R":
+        if run_ready_hand_action(sock, "rg", verbose=True):
+            print_hand_target("right")
+        return None
+    elif key == "P":
+        if run_ready_hand_action(sock, "rr", verbose=True):
+            print_hand_target("right")
         return None
     elif key == "b":
         record_snapshot("arm_teleop")
@@ -1566,7 +1668,7 @@ def _parse_hand_command(cmd: str):
 def validate_robot_command(cmd: str) -> str:
     """Return a normalized valid robot command or raise ValueError."""
     s = cmd.strip()
-    if s in ("init", "rest", "home", "ready", "quit"):
+    if s in ("init", "rest", "home", "ready", "quit") or s in READY_HAND_ACTIONS or s in DISTAL_GRASP_PRESET_ACTIONS:
         return s
     if s.startswith("task "):
         values = _parse_task_command(s)
@@ -1582,7 +1684,7 @@ def validate_robot_command(cmd: str) -> str:
 def apply_robot_command_to_state(cmd: str):
     """Update local task/hand state to match a validated command string."""
     global left_task, right_task, left_hand_target, right_hand_target
-    if cmd in ("init", "rest", "home", "ready", "quit"):
+    if cmd in ("init", "rest", "home", "ready", "quit") or cmd in READY_HAND_ACTIONS or cmd in DISTAL_GRASP_PRESET_ACTIONS:
         return
     if cmd.startswith("task "):
         values = _parse_task_command(cmd)
@@ -1602,12 +1704,20 @@ def dispatch_robot_command(sock, cmd: str, verbose: bool = True, speed_scale: fl
     - ready: load CSV state and send task + hand
     - task: update local state and send task
     - hand: update local state and send hand
+    - lg/lr/rg/rr: ready-based hand-only grasp/release
     - init/rest/home/quit: forward as raw command
     """
     cmd = validate_robot_command(cmd)
 
     if cmd == "ready":
         return send_ready_from_csv(sock, verbose=verbose, speed_scale=speed_scale)
+
+    if cmd in READY_HAND_ACTIONS:
+        return run_ready_hand_action(sock, cmd, verbose=verbose, speed_scale=speed_scale)
+
+    if cmd in DISTAL_GRASP_PRESET_ACTIONS:
+        run_named_grasp_preset(sock, cmd, verbose=verbose, speed_scale=speed_scale)
+        return True
 
     apply_robot_command_to_state(cmd)
 
@@ -1832,7 +1942,7 @@ def execute_natural_language_command(sock, user_text: str, require_confirm: bool
     if ok:
         if cmd == "ready" or cmd.startswith("task "):
             print_task_target()
-        if cmd == "ready" or cmd.startswith("none,"):
+        if cmd == "ready" or cmd in READY_HAND_ACTIONS or cmd in DISTAL_GRASP_PRESET_ACTIONS or cmd.startswith("none,"):
             print_hand_target()
         if cmd == "quit":
             print("[INFO] program terminated by LLM command")
@@ -2226,6 +2336,11 @@ def print_help():
       Distal-only grasp presets for each hand
       Only the last 2 joints of each finger are modified
 
+  lg / lr / rg / rr
+      Ready-based hand-only actions: left grasp/release, right grasp/release
+      Grasp = ready hand pose + grouped flex x3; release = ready hand pose
+      Arm targets are not changed
+
   sendtask
       Send current task target without modifying it
 
@@ -2415,6 +2530,15 @@ def main():
                 speed_scale = parse_optional_speed_scale(tokens, 1)
                 run_named_grasp_preset(snd_sock, cmd, verbose=True, speed_scale=speed_scale)
                 print_hand_target()
+            elif cmd in READY_HAND_ACTIONS:
+                if len(tokens) > 2:
+                    print(f"[ERR] {cmd} command format: {cmd} [speed_scale]")
+                    continue
+                speed_scale = parse_optional_speed_scale(tokens, 1)
+                ok = run_ready_hand_action(snd_sock, cmd, verbose=True, speed_scale=speed_scale)
+                if ok:
+                    side = READY_HAND_ACTIONS[cmd][0]
+                    print_hand_target(side)
             elif cmd == "sendtask":
                 send_current_task(snd_sock, verbose=True)
             elif cmd == "sendhand":
