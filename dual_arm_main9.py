@@ -1,5 +1,6 @@
 import argparse
 import csv
+import json
 import os
 import select
 import socket
@@ -70,6 +71,7 @@ VOICE_DEVICE = os.environ.get("VOICE_DEVICE")
 VOICE_LANGUAGE_MODE = os.environ.get("VOICE_LANGUAGE_MODE", "en").lower()  # "en" | "ko" | "auto"
 VOICE_CONTINUOUS_MODE = False
 VOICE_CONFIRM_MODE = False
+SEQUENCE_COMMAND_DELAY = float(os.environ.get("SEQUENCE_COMMAND_DELAY", "2.0"))
 LLM_SPEC_PATH = os.path.join(SCRIPT_DIR, "robot_command_llm_brief_with_grasp.txt")
 
 
@@ -289,6 +291,12 @@ def parse_optional_speed_scale(tokens, start_idx: int = 1, default: float = DEFA
     if len(tokens) <= start_idx:
         return default
     return float(tokens[start_idx])
+
+
+def set_sequence_command_delay(delay_sec: float):
+    """Set the fixed delay inserted between sequential LLM commands."""
+    global SEQUENCE_COMMAND_DELAY
+    SEQUENCE_COMMAND_DELAY = max(0.0, float(delay_sec))
 
 
 def send_cmd(sock, cmd: str, verbose: bool = True):
@@ -1637,16 +1645,56 @@ def build_llm_state_text() -> str:
     )
 
 
-def extract_quoted_command(text: str):
-    """Extract the first double-quoted command string from LLM output."""
-    m = re.search(r'"([^"\n]+)"', text)
-    if not m:
+def extract_quoted_commands(text: str):
+    """Extract all double-quoted command strings from LLM output."""
+    return [m.strip() for m in re.findall(r'"([^"\n]+)"', text)]
+
+
+def _parse_llm_json_commands(text: str):
+    """Parse the preferred JSON LLM output format, if present."""
+    try:
+        parsed = json.loads(text)
+    except json.JSONDecodeError:
         return None
-    return m.group(1).strip()
+
+    if isinstance(parsed, str):
+        return [parsed]
+    if isinstance(parsed, list):
+        commands = parsed
+    elif isinstance(parsed, dict):
+        commands = parsed.get("commands")
+    else:
+        return None
+
+    if not isinstance(commands, list) or not all(isinstance(cmd, str) for cmd in commands):
+        raise ValueError('JSON LLM output must be a string, a string list, or an object with "commands": [strings]')
+    return commands
+
+
+def parse_llm_robot_commands(text: str):
+    """Parse and validate one or more robot commands from LLM output."""
+    raw = text.strip()
+    commands = _parse_llm_json_commands(raw)
+
+    if commands is None:
+        commands = extract_quoted_commands(raw)
+        if commands:
+            count_match = re.match(r"^\s*(\d+)\b", raw)
+            if count_match:
+                expected_count = int(count_match.group(1))
+                if expected_count != len(commands):
+                    raise ValueError(
+                        f"LLM command count mismatch: declared {expected_count}, found {len(commands)} quoted commands"
+                    )
+
+    if not commands:
+        raise ValueError(f"LLM output does not contain robot commands: {text}")
+
+    return [validate_robot_command(cmd) for cmd in commands]
 
 
 def _parse_task_command(cmd: str):
-    parts = cmd.strip().split()
+    parts = cmd.strip().replace(",", " ").split()
     if len(parts) != 13 or parts[0] != "task":
         raise ValueError("task command must be: task <12 floats>")
     values = [float(x) for x in parts[1:]]
@@ -1698,6 +1746,33 @@ def apply_robot_command_to_state(cmd: str):
     raise ValueError("unsupported command format")
 
 
+def dispatch_robot_command_sequence(
+    sock,
+    commands,
+    verbose: bool = True,
+    speed_scale: float = DEFAULT_SPEED_SCALE,
+    inter_command_delay: float = None,
+):
+    """Dispatch multiple robot commands with a fixed delay between unit actions."""
+    if isinstance(commands, str):
+        commands = [commands]
+
+    delay = SEQUENCE_COMMAND_DELAY if inter_command_delay is None else max(0.0, float(inter_command_delay))
+    for idx, cmd in enumerate(commands, start=1):
+        if verbose and len(commands) > 1:
+            print(f"[SEQ] {idx}/{len(commands)} -> {cmd}")
+        ok = dispatch_robot_command(sock, cmd, verbose=verbose, speed_scale=speed_scale)
+        if not ok:
+            return False
+        if cmd == "quit":
+            return True
+        if idx < len(commands):
+            if verbose:
+                print(f"[SEQ] waiting {delay:.2f} sec before next command")
+            time.sleep(delay)
+    return True
+
+
 def dispatch_robot_command(sock, cmd: str, verbose: bool = True, speed_scale: float = DEFAULT_SPEED_SCALE):
     """
     Dispatch one validated robot command immediately.
@@ -1738,7 +1813,7 @@ def dispatch_robot_command(sock, cmd: str, verbose: bool = True, speed_scale: fl
 
 def request_llm_robot_command(user_text: str):
     """
-    Call OpenAI API and return (validated_robot_command, raw_llm_output).
+    Call OpenAI API and return (validated_robot_commands, raw_llm_output).
     """
     if OpenAI is None:
         raise RuntimeError("openai package is not installed. Run: pip install openai")
@@ -1764,10 +1839,7 @@ def request_llm_robot_command(user_text: str):
     )
 
     raw_output = response.output_text.strip()
-    quoted = extract_quoted_command(raw_output)
-    if quoted is None:
-        raise ValueError(f'LLM output does not contain a quoted command: {raw_output}')
-    validated = validate_robot_command(quoted)
+    validated = parse_llm_robot_commands(raw_output)
     return validated, raw_output
 
 
@@ -1775,8 +1847,8 @@ def chat_mode(sock):
     """
     Interactive LLM chat mode.
     Each user message is sent to the OpenAI API.
-    The LLM must return exactly one robot command in double quotes.
-    The extracted command is validated and immediately dispatched to the robot.
+    The LLM may return one command or a JSON command sequence.
+    The extracted command(s) are validated and dispatched to the robot.
     """
     print("[INFO] entering chat mode...")
     print(f"[INFO] model = {OPENAI_MODEL}")
@@ -1928,23 +2000,31 @@ def execute_natural_language_command(sock, user_text: str, require_confirm: bool
 
     print(f"[USER TEXT] {user_text}")
 
-    cmd, raw = request_llm_robot_command(user_text)
+    commands, raw = request_llm_robot_command(user_text)
     print(f'[LLM RAW] {raw}')
-    print(f'[ACTION] "{cmd}"')
+    print(f'[ACTION COUNT] {len(commands)}')
+    for idx, cmd in enumerate(commands, start=1):
+        print(f'[ACTION {idx}] "{cmd}"')
 
     if require_confirm:
-        if not confirm_voice_action(cmd):
+        if not confirm_voice_action(commands):
             print("[INFO] action canceled")
             scaled_sleep(0.02, speed_scale)
             return True
 
-    ok = dispatch_robot_command(sock, cmd, verbose=True, speed_scale=speed_scale)
+    ok = dispatch_robot_command_sequence(sock, commands, verbose=True, speed_scale=speed_scale)
     if ok:
-        if cmd == "ready" or cmd.startswith("task "):
+        if any(cmd == "ready" or cmd.startswith("task ") for cmd in commands):
             print_task_target()
-        if cmd == "ready" or cmd in READY_HAND_ACTIONS or cmd in DISTAL_GRASP_PRESET_ACTIONS or cmd.startswith("none,"):
+        if any(
+            cmd == "ready"
+            or cmd in READY_HAND_ACTIONS
+            or cmd in DISTAL_GRASP_PRESET_ACTIONS
+            or cmd.startswith("none,")
+            for cmd in commands
+        ):
             print_hand_target()
-        if cmd == "quit":
+        if any(cmd == "quit" for cmd in commands):
             print("[INFO] program terminated by LLM command")
             return False
         scaled_sleep(0.02, speed_scale)
@@ -2360,6 +2440,9 @@ def print_help():
   rotframe [tool|base]
       Print or select the arm teleop rotation frame
 
+  seqdelay [seconds]
+      Print or set the fixed delay between sequential LLM commands
+
   handstep <group_step_rad> <selected_finger_joint_step_rad>
       Update hand teleop step sizes
 
@@ -2578,6 +2661,15 @@ def main():
                     continue
                 set_arm_rotation_frame(tokens[1].lower())
                 print(f"[INFO] arm_rotation_frame -> {arm_rotation_frame}")
+            elif cmd == "seqdelay":
+                if len(tokens) == 1:
+                    print(f"[INFO] sequence command delay = {SEQUENCE_COMMAND_DELAY:.2f} sec")
+                    continue
+                if len(tokens) != 2:
+                    print("[ERR] seqdelay command format: seqdelay [seconds]")
+                    continue
+                set_sequence_command_delay(float(tokens[1]))
+                print(f"[INFO] sequence command delay -> {SEQUENCE_COMMAND_DELAY:.2f} sec")
             elif cmd == "handstep":
                 global hand_step, thumb_joint_step
                 if len(tokens) != 3:
