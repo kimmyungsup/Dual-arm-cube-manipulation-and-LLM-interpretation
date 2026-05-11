@@ -1,5 +1,6 @@
 import argparse
 import csv
+import json
 import os
 import select
 import socket
@@ -70,11 +71,17 @@ VOICE_DEVICE = os.environ.get("VOICE_DEVICE")
 VOICE_LANGUAGE_MODE = os.environ.get("VOICE_LANGUAGE_MODE", "en").lower()  # "en" | "ko" | "auto"
 VOICE_CONTINUOUS_MODE = False
 VOICE_CONFIRM_MODE = False
-LLM_SPEC_PATH = os.path.join(SCRIPT_DIR, "robot_command_llm_brief.txt")
+SEQUENCE_COMMAND_DELAY = float(os.environ.get("SEQUENCE_COMMAND_DELAY", "2.0"))
+LLM_SPEC_PATH = os.path.join(SCRIPT_DIR, "robot_command_llm_brief_with_grasp.txt")
 
 
 
-def _run_cubenet_worker(detector_path: str, classifier_path: str):
+def _run_cubenet_worker(
+    detector_path: str,
+    classifier_path: str,
+    on_face_registered=None,
+    on_capture_completed=None,
+):
     """Background worker that imports and runs CubeNet face-guide mode."""
     try:
         import cubenet_with_face_guide as cubenet_module
@@ -86,7 +93,12 @@ def _run_cubenet_worker(detector_path: str, classifier_path: str):
         print("[INFO] CubeNet face-guide detection thread started")
         print(f"[INFO] detector_path   = {detector_path}")
         print(f"[INFO] classifier_path = {classifier_path}")
-        cubenet_module.main(detector_path, classifier_path)
+        cubenet_module.main(
+            detector_path,
+            classifier_path,
+            on_face_registered=on_face_registered,
+            on_capture_completed=on_capture_completed,
+        )
         print("[INFO] CubeNet face-guide detection thread finished")
     except Exception as e:
         print(f"[ERR] CubeNet face-guide runtime error: {e}")
@@ -95,6 +107,8 @@ def _run_cubenet_worker(detector_path: str, classifier_path: str):
 def start_cubenet_detection_if_needed(
     detector_path: str = CUBENET_DETECTOR_PATH,
     classifier_path: str = CUBENET_CLASSIFIER_PATH,
+    on_face_registered=None,
+    on_capture_completed=None,
 ):
     """Start CubeNet only once. If it is already running, do nothing."""
     global cubenet_thread
@@ -113,7 +127,7 @@ def start_cubenet_detection_if_needed(
 
         cubenet_thread = threading.Thread(
             target=_run_cubenet_worker,
-            args=(detector_path, classifier_path),
+            args=(detector_path, classifier_path, on_face_registered, on_capture_completed),
             daemon=True,
             name="CubeNetThread",
         )
@@ -165,8 +179,9 @@ right_task = np.array([0.30, -0.25, -0.40, 0.0, 0.0, 0.0], dtype=np.float32)
 left_hand_target = np.zeros(20, dtype=np.float32)
 right_hand_target = np.zeros(20, dtype=np.float32)
 
-# Active hand for single-hand teleoperation.
+# Active hand/finger for single-hand teleoperation.
 active_hand = "left"
+active_finger = "thumb"
 
 # UDP addresses.
 DEFAULT_UDP_HOST = "127.0.0.1"
@@ -179,9 +194,15 @@ SRV_ADDR = (DEFAULT_UDP_HOST, 6600)
 pos_step = 0.01   # [m]
 rpy_step = 0.05   # [rad]
 
+# Arm teleoperation rotation frame.
+# "tool" preserves the legacy behavior by incrementing RPY components directly.
+# "base" applies roll/pitch/yaw increments around the robot base X/Y/Z axes.
+arm_rotation_frame = "tool"
+
 # Hand teleoperation step sizes.
 hand_step = 0.08       # [rad] for grouped finger motion
-thumb_joint_step = 0.05  # [rad] for per-thumb-joint motion
+thumb_joint_step = 0.05  # [rad] for per-selected-finger joint motion
+READY_GRASP_GROUPED_FLEX_COUNT = 3
 
 # Default command speed scaling.
 # Each callable command can override this through its own speed_scale argument.
@@ -210,6 +231,14 @@ FINGER_SLICES = {
     "ring": slice(12, 16),
     "little": slice(16, 20),
 }
+FINGER_SELECT_KEYS = {
+    "1": "thumb",
+    "2": "index",
+    "3": "middle",
+    "4": "ring",
+    "5": "little",
+}
+FINGER_ORDER = tuple(FINGER_SELECT_KEYS.values())
 
 
 # =============================================================================
@@ -262,6 +291,12 @@ def parse_optional_speed_scale(tokens, start_idx: int = 1, default: float = DEFA
     if len(tokens) <= start_idx:
         return default
     return float(tokens[start_idx])
+
+
+def set_sequence_command_delay(delay_sec: float):
+    """Set the fixed delay inserted between sequential LLM commands."""
+    global SEQUENCE_COMMAND_DELAY
+    SEQUENCE_COMMAND_DELAY = max(0.0, float(delay_sec))
 
 
 def send_cmd(sock, cmd: str, verbose: bool = True):
@@ -392,11 +427,102 @@ def move_task(arm: str, axis: str, delta: float):
         right_task[idx] += delta
 
 
+def rotation_matrix_from_rpy(roll: float, pitch: float, yaw: float):
+    """Build a rotation matrix from roll/pitch/yaw using Rz(yaw) @ Ry(pitch) @ Rx(roll)."""
+    cr, sr = np.cos(roll), np.sin(roll)
+    cp, sp = np.cos(pitch), np.sin(pitch)
+    cy, sy = np.cos(yaw), np.sin(yaw)
+
+    rx = np.array([
+        [1.0, 0.0, 0.0],
+        [0.0, cr, -sr],
+        [0.0, sr, cr],
+    ], dtype=np.float64)
+    ry = np.array([
+        [cp, 0.0, sp],
+        [0.0, 1.0, 0.0],
+        [-sp, 0.0, cp],
+    ], dtype=np.float64)
+    rz = np.array([
+        [cy, -sy, 0.0],
+        [sy, cy, 0.0],
+        [0.0, 0.0, 1.0],
+    ], dtype=np.float64)
+    return rz @ ry @ rx
+
+
+def rpy_from_rotation_matrix(rot):
+    """Extract roll/pitch/yaw from a rotation matrix using Rz(yaw) @ Ry(pitch) @ Rx(roll)."""
+    pitch = np.arcsin(np.clip(-rot[2, 0], -1.0, 1.0))
+    cp = np.cos(pitch)
+
+    if abs(cp) > 1e-6:
+        roll = np.arctan2(rot[2, 1], rot[2, 2])
+        yaw = np.arctan2(rot[1, 0], rot[0, 0])
+    else:
+        roll = 0.0
+        yaw = np.arctan2(-rot[0, 1], rot[1, 1])
+
+    return np.array([roll, pitch, yaw], dtype=np.float32)
+
+
+def axis_rotation_matrix(axis: str, delta: float):
+    """Build a base-axis rotation matrix for roll(X), pitch(Y), or yaw(Z)."""
+    c, s = np.cos(delta), np.sin(delta)
+    if axis in ("roll", "rx"):
+        return np.array([
+            [1.0, 0.0, 0.0],
+            [0.0, c, -s],
+            [0.0, s, c],
+        ], dtype=np.float64)
+    if axis in ("pitch", "ry"):
+        return np.array([
+            [c, 0.0, s],
+            [0.0, 1.0, 0.0],
+            [-s, 0.0, c],
+        ], dtype=np.float64)
+    if axis in ("yaw", "rz"):
+        return np.array([
+            [c, -s, 0.0],
+            [s, c, 0.0],
+            [0.0, 0.0, 1.0],
+        ], dtype=np.float64)
+    raise ValueError("rotation axis must be one of roll,pitch,yaw (or rx,ry,rz)")
+
+
+def move_task_rotation(arm: str, axis: str, delta: float):
+    """Increment task rotation in either legacy tool-frame mode or base-frame mode."""
+    if arm_rotation_frame == "tool":
+        move_task(arm, axis, delta)
+        return
+    if arm_rotation_frame != "base":
+        raise ValueError("arm_rotation_frame must be 'tool' or 'base'")
+    if arm not in ("l", "r"):
+        raise ValueError("arm must be 'l' or 'r'")
+
+    target = left_task if arm == "l" else right_task
+    current_rot = rotation_matrix_from_rpy(float(target[3]), float(target[4]), float(target[5]))
+    base_delta_rot = axis_rotation_matrix(axis, delta)
+    target[3:6] = rpy_from_rotation_matrix(base_delta_rot @ current_rot)
+
+
+def set_arm_rotation_frame(frame: str):
+    global arm_rotation_frame
+    if frame not in ("tool", "base"):
+        raise ValueError("rotation frame must be 'tool' or 'base'")
+    arm_rotation_frame = frame
+
+
+def toggle_arm_rotation_frame():
+    global arm_rotation_frame
+    arm_rotation_frame = "base" if arm_rotation_frame == "tool" else "tool"
+
+
 def print_task_target():
     print("[Current task target]")
     print("  Left :", " ".join(f"{x:.5f}" for x in left_task))
     print("  Right:", " ".join(f"{x:.5f}" for x in right_task))
-    print(f"  step(pos)={pos_step:.5f} m, step(rpy)={rpy_step:.5f} rad")
+    print(f"  step(pos)={pos_step:.5f} m, step(rpy)={rpy_step:.5f} rad, rotation_frame={arm_rotation_frame}")
 
 
 # =============================================================================
@@ -444,6 +570,17 @@ def toggle_active_hand():
     active_hand = "right" if active_hand == "left" else "left"
 
 
+def set_active_finger(finger: str):
+    global active_finger
+    if finger not in FINGER_SLICES:
+        raise ValueError(f"finger must be one of {', '.join(FINGER_ORDER)}")
+    active_finger = finger
+
+
+def select_active_finger_by_key(key: str):
+    set_active_finger(FINGER_SELECT_KEYS[key])
+
+
 def sync_both_hands_from_feedback():
     global left_hand_target, right_hand_target
     left_hand_target = get_feedback_hand_array("left")
@@ -464,13 +601,25 @@ def move_active_finger_block(finger: str, delta: float):
     target[FINGER_SLICES[finger]] += delta
 
 
+def move_active_finger_joint(finger: str, joint_idx_1to4: int, delta: float):
+    """Increment one of the 4 joints of the selected finger on the active hand."""
+    if finger not in FINGER_SLICES:
+        raise ValueError(f"finger must be one of {', '.join(FINGER_ORDER)}")
+    if joint_idx_1to4 < 1 or joint_idx_1to4 > 4:
+        raise ValueError("finger joint index must be 1..4")
+    target = get_active_hand_array()
+    finger_base = FINGER_SLICES[finger].start
+    target[finger_base + (joint_idx_1to4 - 1)] += delta
+
+
+def move_active_selected_finger_joint(joint_idx_1to4: int, delta: float):
+    """Increment one of the 4 joints of the active finger on the active hand."""
+    move_active_finger_joint(active_finger, joint_idx_1to4, delta)
+
+
 def move_active_thumb_joint(joint_idx_1to4: int, delta: float):
     """Increment one of the 4 thumb joints of the active hand."""
-    if joint_idx_1to4 < 1 or joint_idx_1to4 > 4:
-        raise ValueError("thumb joint index must be 1..4")
-    target = get_active_hand_array()
-    thumb_base = FINGER_SLICES["thumb"].start
-    target[thumb_base + (joint_idx_1to4 - 1)] += delta
+    move_active_finger_joint("thumb", joint_idx_1to4, delta)
 
 
 def move_active_all_fingers(delta: float):
@@ -508,7 +657,7 @@ def print_hand_target(side=None):
         print("[Left hand target]", " ".join(f"{x:.5f}" for x in left_hand_target))
     elif side == "right":
         print("[Right hand target]", " ".join(f"{x:.5f}" for x in right_hand_target))
-    print(f"  active_hand={active_hand}, hand_step={hand_step:.5f}, thumb_joint_step={thumb_joint_step:.5f}")
+    print(f"  active_hand={active_hand}, active_finger={active_finger}, hand_step={hand_step:.5f}, joint_step={thumb_joint_step:.5f}")
 
 
 # =============================================================================
@@ -533,6 +682,12 @@ RIGHT_DISTAL_GRASP_ON = np.array(
     [0.80, 0.80, 0.85, 0.85, 0.85, 0.85, 0.85, 0.85, 0.85, 0.85],
     dtype=np.float32,
 )
+DISTAL_GRASP_PRESET_ACTIONS = {
+    "left_grasp_on": ("left", True),
+    "left_grasp_off": ("left", False),
+    "right_grasp_on": ("right", True),
+    "right_grasp_off": ("right", False),
+}
 
 
 def set_hand_distal_grasp_preset(side: str, on: bool):
@@ -569,16 +724,10 @@ def run_named_grasp_preset(sock, name: str, verbose: bool = True, speed_scale: f
     - right_grasp_on
     - right_grasp_off
     """
-    mapping = {
-        "left_grasp_on": ("left", True),
-        "left_grasp_off": ("left", False),
-        "right_grasp_on": ("right", True),
-        "right_grasp_off": ("right", False),
-    }
-    if name not in mapping:
+    if name not in DISTAL_GRASP_PRESET_ACTIONS:
         raise ValueError(f"unknown grasp preset: {name}")
 
-    side, on = mapping[name]
+    side, on = DISTAL_GRASP_PRESET_ACTIONS[name]
     set_hand_distal_grasp_preset(side, on)
 
     if verbose:
@@ -586,6 +735,87 @@ def run_named_grasp_preset(sock, name: str, verbose: bool = True, speed_scale: f
 
     send_current_hand(sock, verbose=verbose)
     scaled_sleep(0.02, speed_scale)
+
+
+READY_HAND_ACTIONS = {
+    "lg": ("left", True, "left grasp"),
+    "lr": ("left", False, "left release"),
+    "rg": ("right", True, "right grasp"),
+    "rr": ("right", False, "right release"),
+}
+
+
+def apply_grouped_flex_to_hand_pose(side: str, hand_pose, step: float, count: int = READY_GRASP_GROUPED_FLEX_COUNT):
+    """Return a hand pose after applying z-style grouped flex several times."""
+    if side not in ("left", "right"):
+        raise ValueError("side must be 'left' or 'right'")
+
+    target = np.array(hand_pose, dtype=np.float32).copy()
+    delta = float(step) * int(count)
+
+    for finger in ("index", "middle", "ring", "little"):
+        target[FINGER_SLICES[finger]] += delta
+
+    thumb_delta = (-delta if side == "left" else delta)
+    thumb_base = FINGER_SLICES["thumb"].start
+    target[thumb_base + 2] += thumb_delta
+    target[thumb_base + 3] += thumb_delta
+    return target
+
+
+def set_ready_hand_action_target(
+    side: str,
+    grasp: bool,
+    path: str = READY_CSV_PATH,
+    step: float = None,
+    count: int = READY_GRASP_GROUPED_FLEX_COUNT,
+):
+    """Set one hand to ready release or ready + grouped-flex grasp while leaving arms untouched."""
+    global left_hand_target, right_hand_target
+
+    state = load_ready_state_from_csv(path)
+    if state is None:
+        return False
+
+    ready_key = f"{side}_hand_target"
+    ready_hand = state[ready_key].copy()
+    if grasp:
+        next_hand = apply_grouped_flex_to_hand_pose(
+            side,
+            ready_hand,
+            hand_step if step is None else step,
+            count=count,
+        )
+    else:
+        next_hand = ready_hand
+
+    if side == "left":
+        left_hand_target = next_hand
+    elif side == "right":
+        right_hand_target = next_hand
+    else:
+        raise ValueError("side must be 'left' or 'right'")
+
+    return True
+
+
+def run_ready_hand_action(sock, action: str, verbose: bool = True, speed_scale: float = DEFAULT_SPEED_SCALE):
+    """Run lg/lr/rg/rr ready-based hand-only grasp/release actions."""
+    if action not in READY_HAND_ACTIONS:
+        raise ValueError(f"unknown ready hand action: {action}")
+
+    side, grasp, label = READY_HAND_ACTIONS[action]
+    ok = set_ready_hand_action_target(side, grasp)
+    if not ok:
+        return False
+
+    if verbose:
+        mode = "ready + grouped flex x3" if grasp else "ready hand pose"
+        print(f"[INFO] {label} ({action}) -> {mode}; arm targets unchanged")
+
+    send_current_hand(sock, verbose=verbose)
+    scaled_sleep(0.02, speed_scale)
+    return True
 
 
 # =============================================================================
@@ -864,6 +1094,7 @@ def print_arm_teleop_help():
     print(
         f"""
 [ARM TELEOP MODE]  (press 'm' again to exit)
+rotation_frame = {arm_rotation_frame}
 
 Left arm translation
   w/s : +x / -x
@@ -888,6 +1119,11 @@ Right arm rotation
 Other controls
   z/x : decrease/increase position step ({pos_step:.5f} m current)
   c/v : decrease/increase rotation step ({rpy_step:.5f} rad current)
+  \\  : toggle rotation frame (tool/base)
+  L   : lg, left ready-based grasp (hand only)
+  O   : lr, left ready-based release (hand only)
+  R   : rg, right ready-based grasp (hand only)
+  P   : rr, right ready-based release (hand only)
   b   : record current scenario snapshot
   1   : send init
   2   : send rest
@@ -915,17 +1151,17 @@ def teleop_key_action(sock, key: str):
     elif key == "f":
         move_task("l", "z", -pos_step)
     elif key == "t":
-        move_task("l", "roll", +rpy_step)
+        move_task_rotation("l", "roll", +rpy_step)
     elif key == "g":
-        move_task("l", "roll", -rpy_step)
+        move_task_rotation("l", "roll", -rpy_step)
     elif key == "y":
-        move_task("l", "pitch", +rpy_step)
+        move_task_rotation("l", "pitch", +rpy_step)
     elif key == "h":
-        move_task("l", "pitch", -rpy_step)
+        move_task_rotation("l", "pitch", -rpy_step)
     elif key == "u":
-        move_task("l", "yaw", +rpy_step)
+        move_task_rotation("l", "yaw", +rpy_step)
     elif key == "j":
-        move_task("l", "yaw", -rpy_step)
+        move_task_rotation("l", "yaw", -rpy_step)
     elif key == "i":
         move_task("r", "x", +pos_step)
     elif key == "k":
@@ -939,17 +1175,17 @@ def teleop_key_action(sock, key: str):
     elif key == ";":
         move_task("r", "z", -pos_step)
     elif key == "7":
-        move_task("r", "roll", +rpy_step)
+        move_task_rotation("r", "roll", +rpy_step)
     elif key == "4":
-        move_task("r", "roll", -rpy_step)
+        move_task_rotation("r", "roll", -rpy_step)
     elif key == "8":
-        move_task("r", "pitch", +rpy_step)
+        move_task_rotation("r", "pitch", +rpy_step)
     elif key == "5":
-        move_task("r", "pitch", -rpy_step)
+        move_task_rotation("r", "pitch", -rpy_step)
     elif key == "9":
-        move_task("r", "yaw", +rpy_step)
+        move_task_rotation("r", "yaw", +rpy_step)
     elif key == "6":
-        move_task("r", "yaw", -rpy_step)
+        move_task_rotation("r", "yaw", -rpy_step)
     elif key == "z":
         pos_step = max(0.001, pos_step * 0.5)
         print(f"\n[INFO] pos_step -> {pos_step:.5f} m")
@@ -965,6 +1201,26 @@ def teleop_key_action(sock, key: str):
     elif key == "v":
         rpy_step = min(1.0, rpy_step * 2.0)
         print(f"\n[INFO] rpy_step -> {rpy_step:.5f} rad")
+        return None
+    elif key == "\\":
+        toggle_arm_rotation_frame()
+        print(f"\n[INFO] arm_rotation_frame -> {arm_rotation_frame}")
+        return None
+    elif key == "L":
+        if run_ready_hand_action(sock, "lg", verbose=True):
+            print_hand_target("left")
+        return None
+    elif key == "O":
+        if run_ready_hand_action(sock, "lr", verbose=True):
+            print_hand_target("left")
+        return None
+    elif key == "R":
+        if run_ready_hand_action(sock, "rg", verbose=True):
+            print_hand_target("right")
+        return None
+    elif key == "P":
+        if run_ready_hand_action(sock, "rr", verbose=True):
+            print_hand_target("right")
         return None
     elif key == "b":
         record_snapshot("arm_teleop")
@@ -991,7 +1247,8 @@ def teleop_key_action(sock, key: str):
 
     send_current_task_rate_limited(sock, verbose=False)
     sys.stdout.write(
-        f"\r[L] xyz=({left_task[0]: .3f}, {left_task[1]: .3f}, {left_task[2]: .3f}) "
+        f"\r[rot={arm_rotation_frame}] "
+        f"[L] xyz=({left_task[0]: .3f}, {left_task[1]: .3f}, {left_task[2]: .3f}) "
         f"rpy=({left_task[3]: .3f}, {left_task[4]: .3f}, {left_task[5]: .3f}) | "
         f"[R] xyz=({right_task[0]: .3f}, {right_task[1]: .3f}, {right_task[2]: .3f}) "
         f"rpy=({right_task[3]: .3f}, {right_task[4]: .3f}, {right_task[5]: .3f})   "
@@ -1026,14 +1283,22 @@ def print_hand_teleop_help():
         f"""
 [HAND TELEOP MODE]  (press 'n' again to exit)
 active_hand = {active_hand}
+active_finger = {active_finger}
 
-Thumb individual joints
-  q/a : thumb_j1 + / -
-  w/s : thumb_j2 + / -
-  e/d : thumb_j3 + / -
-  r/f : thumb_j4 + / -
+Finger select
+  1 : select thumb  (joints 1-4)
+  2 : select index  (joints 5-8)
+  3 : select middle (joints 9-12)
+  4 : select ring   (joints 13-16)
+  5 : select little (joints 17-20)
 
-Other fingers (4-joint block control)
+Selected finger individual joints
+  q/a : selected finger j1 + / -
+  w/s : selected finger j2 + / -
+  e/d : selected finger j3 + / -
+  r/f : selected finger j4 + / -
+
+Optional 4-joint block control
   t/g : index  flex / extend
   y/h : middle flex / extend
   u/j : ring   flex / extend
@@ -1051,14 +1316,14 @@ Hand select
 
 Other controls
   ,/. : decrease/increase grouped finger step ({hand_step:.5f} rad current)
-  ;/' : decrease/increase thumb joint step ({thumb_joint_step:.5f} rad current)
-  4   : print hand target
-  5   : sync both hands from feedback
+  ;/' : decrease/increase selected-finger joint step ({thumb_joint_step:.5f} rad current)
+  p   : print hand target
+  0   : sync both hands from feedback
   6   : sync active hand from feedback
   b   : record current scenario snapshot
-  1   : send init
-  2   : send rest
-  3   : send home
+  I   : send init
+  R   : send rest
+  H   : send home
   n   : exit hand teleop mode
   Q   : send quit and terminate program
 """
@@ -1068,22 +1333,26 @@ Other controls
 def hand_teleop_key_action(sock, key: str):
     global hand_step, thumb_joint_step
 
-    if key == "q":
-        move_active_thumb_joint(1, +thumb_joint_step)
+    if key in FINGER_SELECT_KEYS:
+        select_active_finger_by_key(key)
+        print(f"\n[INFO] active_finger -> {active_finger}")
+        return None
+    elif key == "q":
+        move_active_selected_finger_joint(1, +thumb_joint_step)
     elif key == "a":
-        move_active_thumb_joint(1, -thumb_joint_step)
+        move_active_selected_finger_joint(1, -thumb_joint_step)
     elif key == "w":
-        move_active_thumb_joint(2, +thumb_joint_step)
+        move_active_selected_finger_joint(2, +thumb_joint_step)
     elif key == "s":
-        move_active_thumb_joint(2, -thumb_joint_step)
+        move_active_selected_finger_joint(2, -thumb_joint_step)
     elif key == "e":
-        move_active_thumb_joint(3, +thumb_joint_step)
+        move_active_selected_finger_joint(3, +thumb_joint_step)
     elif key == "d":
-        move_active_thumb_joint(3, -thumb_joint_step)
+        move_active_selected_finger_joint(3, -thumb_joint_step)
     elif key == "r":
-        move_active_thumb_joint(4, +thumb_joint_step)
+        move_active_selected_finger_joint(4, +thumb_joint_step)
     elif key == "f":
-        move_active_thumb_joint(4, -thumb_joint_step)
+        move_active_selected_finger_joint(4, -thumb_joint_step)
     elif key == "t":
         move_active_finger_block("index", +hand_step)
     elif key == "g":
@@ -1126,16 +1395,16 @@ def hand_teleop_key_action(sock, key: str):
         return None
     elif key == ";":
         thumb_joint_step = max(0.002, thumb_joint_step * 0.5)
-        print(f"\n[INFO] thumb_joint_step -> {thumb_joint_step:.5f} rad")
+        print(f"\n[INFO] selected-finger joint_step -> {thumb_joint_step:.5f} rad")
         return None
     elif key == "'":
         thumb_joint_step = min(1.0, thumb_joint_step * 2.0)
-        print(f"\n[INFO] thumb_joint_step -> {thumb_joint_step:.5f} rad")
+        print(f"\n[INFO] selected-finger joint_step -> {thumb_joint_step:.5f} rad")
         return None
-    elif key == "4":
+    elif key == "p":
         print_hand_target()
         return None
-    elif key == "5":
+    elif key == "0":
         sync_both_hands_from_feedback()
         print("\n[INFO] both hand targets synced from feedback")
         return None
@@ -1146,13 +1415,13 @@ def hand_teleop_key_action(sock, key: str):
     elif key == "b":
         record_snapshot("hand_teleop")
         return None
-    elif key == "1":
+    elif key == "I":
         send_cmd(sock, "init")
         return None
-    elif key == "2":
+    elif key == "R":
         send_cmd(sock, "rest")
         return None
-    elif key == "3":
+    elif key == "H":
         send_cmd(sock, "home")
         return None
     elif key == "n":
@@ -1165,8 +1434,11 @@ def hand_teleop_key_action(sock, key: str):
 
     send_current_hand_rate_limited(sock, verbose=False)
     target = get_active_hand_array()
+    selected = target[FINGER_SLICES[active_finger]]
     sys.stdout.write(
-        f"\r[{active_hand}] thumb=({target[0]: .3f}, {target[1]: .3f}, {target[2]: .3f}, {target[3]: .3f}) "
+        f"\r[{active_hand}/{active_finger}] "
+        f"selected=({selected[0]: .3f},{selected[1]: .3f},{selected[2]: .3f},{selected[3]: .3f}) "
+        f"thumb=({target[0]: .3f},{target[1]: .3f},{target[2]: .3f},{target[3]: .3f}) "
         f"index=({target[4]: .3f},{target[5]: .3f},{target[6]: .3f},{target[7]: .3f}) "
         f"middle=({target[8]: .3f},{target[9]: .3f},{target[10]: .3f},{target[11]: .3f})   "
     )
@@ -1226,7 +1498,27 @@ def print_current_summary_for_scenario():
 
 def scenario_mode(sock):
     """Keyboard mode for scenario authoring and command example export."""
-    start_cubenet_detection_if_needed()
+    def on_face_registered(face_idx, face_name, color_names, progress, total_faces):
+        print(
+            f"[SCENARIO][CUBENET] registered face {face_name} (idx={face_idx}) "
+            f"{progress}/{total_faces} -> {color_names}"
+        )
+        print("[SCENARIO][CUBENET] running inter-face test grasp motions...")
+        run_named_grasp_preset(sock, "left_grasp_off", verbose=True, speed_scale=DEFAULT_SPEED_SCALE)
+        run_named_grasp_preset(sock, "right_grasp_on", verbose=True, speed_scale=DEFAULT_SPEED_SCALE)
+
+    def on_capture_completed(face_data_map, solution):
+        print("\n[SCENARIO][CUBENET] all 6 faces captured.")
+        print("[SCENARIO][CUBENET] captured cube face data:")
+        for face_name in ["U", "R", "F", "D", "L", "B"]:
+            colors = face_data_map.get(face_name)
+            print(f"  - {face_name}: {colors if colors else 'N/A'}")
+        print(f"[SCENARIO][CUBENET] cube manipulation sequence: {solution}")
+
+    start_cubenet_detection_if_needed(
+        on_face_registered=on_face_registered,
+        on_capture_completed=on_capture_completed,
+    )
 
     print_scenario_mode_help()
     print_current_summary_for_scenario()
@@ -1353,16 +1645,56 @@ def build_llm_state_text() -> str:
     )
 
 
-def extract_quoted_command(text: str):
-    """Extract the first double-quoted command string from LLM output."""
-    m = re.search(r'"([^"\n]+)"', text)
-    if not m:
+def extract_quoted_commands(text: str):
+    """Extract all double-quoted command strings from LLM output."""
+    return [m.strip() for m in re.findall(r'"([^"\n]+)"', text)]
+
+
+def _parse_llm_json_commands(text: str):
+    """Parse the preferred JSON LLM output format, if present."""
+    try:
+        parsed = json.loads(text)
+    except json.JSONDecodeError:
         return None
-    return m.group(1).strip()
+
+    if isinstance(parsed, str):
+        return [parsed]
+    if isinstance(parsed, list):
+        commands = parsed
+    elif isinstance(parsed, dict):
+        commands = parsed.get("commands")
+    else:
+        return None
+
+    if not isinstance(commands, list) or not all(isinstance(cmd, str) for cmd in commands):
+        raise ValueError('JSON LLM output must be a string, a string list, or an object with "commands": [strings]')
+    return commands
+
+
+def parse_llm_robot_commands(text: str):
+    """Parse and validate one or more robot commands from LLM output."""
+    raw = text.strip()
+    commands = _parse_llm_json_commands(raw)
+
+    if commands is None:
+        commands = extract_quoted_commands(raw)
+        if commands:
+            count_match = re.match(r"^\s*(\d+)\b", raw)
+            if count_match:
+                expected_count = int(count_match.group(1))
+                if expected_count != len(commands):
+                    raise ValueError(
+                        f"LLM command count mismatch: declared {expected_count}, found {len(commands)} quoted commands"
+                    )
+
+    if not commands:
+        raise ValueError(f"LLM output does not contain robot commands: {text}")
+
+    return [validate_robot_command(cmd) for cmd in commands]
 
 
 def _parse_task_command(cmd: str):
-    parts = cmd.strip().split()
+    parts = cmd.strip().replace(",", " ").split()
     if len(parts) != 13 or parts[0] != "task":
         raise ValueError("task command must be: task <12 floats>")
     values = [float(x) for x in parts[1:]]
@@ -1384,7 +1716,7 @@ def _parse_hand_command(cmd: str):
 def validate_robot_command(cmd: str) -> str:
     """Return a normalized valid robot command or raise ValueError."""
     s = cmd.strip()
-    if s in ("init", "rest", "home", "ready", "quit"):
+    if s in ("init", "rest", "home", "ready", "quit") or s in READY_HAND_ACTIONS or s in DISTAL_GRASP_PRESET_ACTIONS:
         return s
     if s.startswith("task "):
         values = _parse_task_command(s)
@@ -1400,7 +1732,7 @@ def validate_robot_command(cmd: str) -> str:
 def apply_robot_command_to_state(cmd: str):
     """Update local task/hand state to match a validated command string."""
     global left_task, right_task, left_hand_target, right_hand_target
-    if cmd in ("init", "rest", "home", "ready", "quit"):
+    if cmd in ("init", "rest", "home", "ready", "quit") or cmd in READY_HAND_ACTIONS or cmd in DISTAL_GRASP_PRESET_ACTIONS:
         return
     if cmd.startswith("task "):
         values = _parse_task_command(cmd)
@@ -1414,18 +1746,53 @@ def apply_robot_command_to_state(cmd: str):
     raise ValueError("unsupported command format")
 
 
+def dispatch_robot_command_sequence(
+    sock,
+    commands,
+    verbose: bool = True,
+    speed_scale: float = DEFAULT_SPEED_SCALE,
+    inter_command_delay: float = None,
+):
+    """Dispatch multiple robot commands with a fixed delay between unit actions."""
+    if isinstance(commands, str):
+        commands = [commands]
+
+    delay = SEQUENCE_COMMAND_DELAY if inter_command_delay is None else max(0.0, float(inter_command_delay))
+    for idx, cmd in enumerate(commands, start=1):
+        if verbose and len(commands) > 1:
+            print(f"[SEQ] {idx}/{len(commands)} -> {cmd}")
+        ok = dispatch_robot_command(sock, cmd, verbose=verbose, speed_scale=speed_scale)
+        if not ok:
+            return False
+        if cmd == "quit":
+            return True
+        if idx < len(commands):
+            if verbose:
+                print(f"[SEQ] waiting {delay:.2f} sec before next command")
+            time.sleep(delay)
+    return True
+
+
 def dispatch_robot_command(sock, cmd: str, verbose: bool = True, speed_scale: float = DEFAULT_SPEED_SCALE):
     """
     Dispatch one validated robot command immediately.
     - ready: load CSV state and send task + hand
     - task: update local state and send task
     - hand: update local state and send hand
+    - lg/lr/rg/rr: ready-based hand-only grasp/release
     - init/rest/home/quit: forward as raw command
     """
     cmd = validate_robot_command(cmd)
 
     if cmd == "ready":
         return send_ready_from_csv(sock, verbose=verbose, speed_scale=speed_scale)
+
+    if cmd in READY_HAND_ACTIONS:
+        return run_ready_hand_action(sock, cmd, verbose=verbose, speed_scale=speed_scale)
+
+    if cmd in DISTAL_GRASP_PRESET_ACTIONS:
+        run_named_grasp_preset(sock, cmd, verbose=verbose, speed_scale=speed_scale)
+        return True
 
     apply_robot_command_to_state(cmd)
 
@@ -1446,7 +1813,7 @@ def dispatch_robot_command(sock, cmd: str, verbose: bool = True, speed_scale: fl
 
 def request_llm_robot_command(user_text: str):
     """
-    Call OpenAI API and return (validated_robot_command, raw_llm_output).
+    Call OpenAI API and return (validated_robot_commands, raw_llm_output).
     """
     if OpenAI is None:
         raise RuntimeError("openai package is not installed. Run: pip install openai")
@@ -1472,10 +1839,7 @@ def request_llm_robot_command(user_text: str):
     )
 
     raw_output = response.output_text.strip()
-    quoted = extract_quoted_command(raw_output)
-    if quoted is None:
-        raise ValueError(f'LLM output does not contain a quoted command: {raw_output}')
-    validated = validate_robot_command(quoted)
+    validated = parse_llm_robot_commands(raw_output)
     return validated, raw_output
 
 
@@ -1483,8 +1847,8 @@ def chat_mode(sock):
     """
     Interactive LLM chat mode.
     Each user message is sent to the OpenAI API.
-    The LLM must return exactly one robot command in double quotes.
-    The extracted command is validated and immediately dispatched to the robot.
+    The LLM may return one command or a JSON command sequence.
+    The extracted command(s) are validated and dispatched to the robot.
     """
     print("[INFO] entering chat mode...")
     print(f"[INFO] model = {OPENAI_MODEL}")
@@ -1636,23 +2000,31 @@ def execute_natural_language_command(sock, user_text: str, require_confirm: bool
 
     print(f"[USER TEXT] {user_text}")
 
-    cmd, raw = request_llm_robot_command(user_text)
+    commands, raw = request_llm_robot_command(user_text)
     print(f'[LLM RAW] {raw}')
-    print(f'[ACTION] "{cmd}"')
+    print(f'[ACTION COUNT] {len(commands)}')
+    for idx, cmd in enumerate(commands, start=1):
+        print(f'[ACTION {idx}] "{cmd}"')
 
     if require_confirm:
-        if not confirm_voice_action(cmd):
+        if not confirm_voice_action(commands):
             print("[INFO] action canceled")
             scaled_sleep(0.02, speed_scale)
             return True
 
-    ok = dispatch_robot_command(sock, cmd, verbose=True, speed_scale=speed_scale)
+    ok = dispatch_robot_command_sequence(sock, commands, verbose=True, speed_scale=speed_scale)
     if ok:
-        if cmd == "ready" or cmd.startswith("task "):
+        if any(cmd == "ready" or cmd.startswith("task ") for cmd in commands):
             print_task_target()
-        if cmd == "ready" or cmd.startswith("none,"):
+        if any(
+            cmd == "ready"
+            or cmd in READY_HAND_ACTIONS
+            or cmd in DISTAL_GRASP_PRESET_ACTIONS
+            or cmd.startswith("none,")
+            for cmd in commands
+        ):
             print_hand_target()
-        if cmd == "quit":
+        if any(cmd == "quit" for cmd in commands):
             print("[INFO] program terminated by LLM command")
             return False
         scaled_sleep(0.02, speed_scale)
@@ -2044,6 +2416,11 @@ def print_help():
       Distal-only grasp presets for each hand
       Only the last 2 joints of each finger are modified
 
+  lg / lr / rg / rr
+      Ready-based hand-only actions: left grasp/release, right grasp/release
+      Grasp = ready hand pose + grouped flex x3; release = ready hand pose
+      Arm targets are not changed
+
   sendtask
       Send current task target without modifying it
 
@@ -2060,11 +2437,17 @@ def print_help():
   step <pos_step_m> <rpy_step_rad>
       Update task teleop step sizes
 
-  handstep <group_step_rad> <thumb_joint_step_rad>
+  rotframe [tool|base]
+      Print or select the arm teleop rotation frame
+
+  seqdelay [seconds]
+      Print or set the fixed delay between sequential LLM commands
+
+  handstep <group_step_rad> <selected_finger_joint_step_rad>
       Update hand teleop step sizes
 
   currenthand
-      Print currently selected active hand
+      Print currently selected active hand/finger
 
   switchhand <left|right>
       Select active hand for hand teleop
@@ -2230,6 +2613,15 @@ def main():
                 speed_scale = parse_optional_speed_scale(tokens, 1)
                 run_named_grasp_preset(snd_sock, cmd, verbose=True, speed_scale=speed_scale)
                 print_hand_target()
+            elif cmd in READY_HAND_ACTIONS:
+                if len(tokens) > 2:
+                    print(f"[ERR] {cmd} command format: {cmd} [speed_scale]")
+                    continue
+                speed_scale = parse_optional_speed_scale(tokens, 1)
+                ok = run_ready_hand_action(snd_sock, cmd, verbose=True, speed_scale=speed_scale)
+                if ok:
+                    side = READY_HAND_ACTIONS[cmd][0]
+                    print_hand_target(side)
             elif cmd == "sendtask":
                 send_current_task(snd_sock, verbose=True)
             elif cmd == "sendhand":
@@ -2260,16 +2652,34 @@ def main():
                 pos_step = float(tokens[1])
                 rpy_step = float(tokens[2])
                 print(f"[INFO] updated task step sizes -> pos: {pos_step:.5f} m, rpy: {rpy_step:.5f} rad")
+            elif cmd == "rotframe":
+                if len(tokens) == 1:
+                    print(f"[INFO] arm_rotation_frame = {arm_rotation_frame}")
+                    continue
+                if len(tokens) != 2:
+                    print("[ERR] rotframe command format: rotframe [tool|base]")
+                    continue
+                set_arm_rotation_frame(tokens[1].lower())
+                print(f"[INFO] arm_rotation_frame -> {arm_rotation_frame}")
+            elif cmd == "seqdelay":
+                if len(tokens) == 1:
+                    print(f"[INFO] sequence command delay = {SEQUENCE_COMMAND_DELAY:.2f} sec")
+                    continue
+                if len(tokens) != 2:
+                    print("[ERR] seqdelay command format: seqdelay [seconds]")
+                    continue
+                set_sequence_command_delay(float(tokens[1]))
+                print(f"[INFO] sequence command delay -> {SEQUENCE_COMMAND_DELAY:.2f} sec")
             elif cmd == "handstep":
                 global hand_step, thumb_joint_step
                 if len(tokens) != 3:
-                    print("[ERR] handstep command format: handstep <group_step_rad> <thumb_joint_step_rad>")
+                    print("[ERR] handstep command format: handstep <group_step_rad> <selected_finger_joint_step_rad>")
                     continue
                 hand_step = float(tokens[1])
                 thumb_joint_step = float(tokens[2])
-                print(f"[INFO] updated hand step sizes -> hand: {hand_step:.5f} rad, thumb: {thumb_joint_step:.5f} rad")
+                print(f"[INFO] updated hand step sizes -> grouped: {hand_step:.5f} rad, selected-finger joint: {thumb_joint_step:.5f} rad")
             elif cmd == "currenthand":
-                print(f"[INFO] active_hand = {active_hand}")
+                print(f"[INFO] active_hand = {active_hand}, active_finger = {active_finger}")
             elif cmd == "switchhand":
                 if len(tokens) != 2:
                     print("[ERR] switchhand command format: switchhand <left|right>")
