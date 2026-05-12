@@ -2542,23 +2542,74 @@ def apply_snapshot_row_to_local_state(row):
     )
 
 
-def run_cube_sequence(sock, speed_scale: float = DEFAULT_SPEED_SCALE):
+def run_cube_custom_motion(
+    sock,
+    identifier: str,
+    row_delay: float = 2.0,
+    speed_scale: float = DEFAULT_SPEED_SCALE,
+):
+    """Run one custom_motion.csv row inside the cube sequence and wait after it."""
+    print(f'[CUBE] custom_motion.csv -> motion "{identifier}"')
+    ok = run_custom_motion(sock, identifier, verbose=True, speed_scale=speed_scale)
+    if not ok:
+        print(f'[ERR] cube sequence stopped during custom motion: {identifier}')
+        return False
+    scaled_sleep(row_delay, speed_scale)
+    return True
+
+
+def run_cube_custom_motion_sequence(
+    sock,
+    identifiers,
+    row_delay: float = 2.0,
+    speed_scale: float = DEFAULT_SPEED_SCALE,
+):
+    """Run a list of custom_motion.csv rows in order."""
+    for idx, identifier in enumerate(identifiers, start=1):
+        print(f'[CUBE] custom motion {idx}/{len(identifiers)}')
+        ok = run_cube_custom_motion(
+            sock,
+            identifier,
+            row_delay=row_delay,
+            speed_scale=speed_scale,
+        )
+        if not ok:
+            return False
+    return True
+
+
+def run_cube_sequence(sock, speed_scale: float = DEFAULT_SPEED_SCALE, custom_motion_names=None):
     """
     Execute predefined cube motions using reusable snapshot CSV helpers.
 
-    Readable one-line style:
+    Readable one-line styles:
         run_snapshot_csv_motion(sock, "file.csv", use_arm=True, use_hand=True)
+        run_cube_custom_motion(sock, "my_motion_alias")
 
     Motion type options:
     - use_arm=True,  use_hand=True  -> execute both task and hand
     - use_arm=True,  use_hand=False -> execute arm only
     - use_arm=False, use_hand=True  -> execute hand only
+    - custom_motion.csv rows use their own motion_use_arm / motion_use_hand flags
 
     Notes:
     - speed_scale is intentionally passed per called command.
     - In custom cube scenarios, each call can override speed_scale independently.
+    - Passing custom_motion_names runs only those custom motions in order.
     """
     print("[INFO] entering cube mode...")
+
+    if custom_motion_names:
+        return run_cube_custom_motion_sequence(
+            sock,
+            custom_motion_names,
+            row_delay=2.0,
+            speed_scale=speed_scale,
+        )
+
+    # To mix custom_motion.csv rows into the predefined cube routine, insert a line
+    # like this anywhere in the sequence and check the returned ok value:
+    # ok = run_cube_custom_motion(sock, "my_motion_alias", row_delay=2.0, speed_scale=speed_scale)
 
     # 1. pick the cube
     ok = run_snapshot_csv_motion(
@@ -2728,10 +2779,14 @@ def print_help():
 
   cube [speed_scale]
       Execute predefined cube scenario snapshot CSV files in sequence
-      Current order:
+
+  cube <motion_alias> [motion_alias ...] [speed_scale]
+      Execute custom_motion.csv rows in the given order instead of the predefined cube sequence
+      Prefer motion_alias values without spaces for this shorthand
+      Current predefined order:
         scenario_left_grasp.csv
-        scenario_left_rotate.csv
         scenario_right_rotate.csv
+        scenario_left_rotate.csv
       For each CSV row:
         1) send task command
         2) wait 0.5 sec
@@ -2991,11 +3046,19 @@ def main():
                 allowed_source_ip = tokens[3] if len(tokens) == 4 else None
                 receive_test_mode(bind_ip, port, allowed_source_ip=allowed_source_ip)
             elif cmd == "cube":
-                if len(tokens) > 2:
-                    print("[ERR] cube command format: cube [speed_scale]")
-                    continue
-                speed_scale = parse_optional_speed_scale(tokens, 1)
-                ok = run_cube_sequence(snd_sock, speed_scale=speed_scale)
+                speed_scale = DEFAULT_SPEED_SCALE
+                custom_motion_names = tokens[1:]
+                if len(tokens) >= 2:
+                    try:
+                        speed_scale = float(tokens[-1])
+                        custom_motion_names = tokens[1:-1]
+                    except ValueError:
+                        pass
+                ok = run_cube_sequence(
+                    snd_sock,
+                    speed_scale=speed_scale,
+                    custom_motion_names=custom_motion_names,
+                )
                 if not ok:
                     print("[ERR] cube mode terminated with an error")
             elif cmd == "chat":
