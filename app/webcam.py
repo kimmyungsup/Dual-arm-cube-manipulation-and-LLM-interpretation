@@ -5,6 +5,19 @@ import open3d as o3d
 
 __appname__ = "CubeNet"
 
+_SIMPLE_WB = None
+_CLAHE = None
+
+
+def _get_color_preprocess_ops():
+    global _SIMPLE_WB, _CLAHE
+    if _SIMPLE_WB is None:
+        _SIMPLE_WB = cv2.xphoto.createSimpleWB()
+        _SIMPLE_WB.setP(0.5)
+    if _CLAHE is None:
+        _CLAHE = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+    return _SIMPLE_WB, _CLAHE
+
 class WebcamInteractor:
     display_size = (1440, 820)
 
@@ -109,14 +122,12 @@ def visualize(color_image, pose, intrinsic):
     return color_image
 
 def color_preprocess(color):
-    wb = cv2.xphoto.createSimpleWB()
-    wb.setP(0.5)
+    wb, clahe = _get_color_preprocess_ops()
     balanced = wb.balanceWhite(color)
 
     hsv = cv2.cvtColor(balanced, cv2.COLOR_BGR2HSV)
     h, s, v = cv2.split(hsv)
 
-    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
     v_eq = clahe.apply(v)
 
     hsv_eq = cv2.merge([h, s, v_eq])

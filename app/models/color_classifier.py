@@ -53,14 +53,9 @@ class KNNClassifier:
                 for center_y, center_x in product(self.centers, repeat=2)]
 
     def my_get_colors(self, color_list):
-        lab_list = []
-        for c in color_list:
-            c = list(c)
-            bgr = np.array([[c]], dtype=np.uint8)  # shape (1,1,3)
-            lab = cv.cvtColor(bgr, cv.COLOR_BGR2LAB)
-            lab_vec = lab[0, 0]
-            lab_list.append(lab_vec[np.newaxis, :])
-        return [Color(self.model.predict(lab)[0]) for lab in lab_list]
+        bgr = np.asarray(color_list, dtype=np.uint8).reshape(-1, 1, 3)
+        lab = cv.cvtColor(bgr, cv.COLOR_BGR2LAB).reshape(-1, 3)
+        return [Color(label) for label in self.model.predict(lab)]
 
 
 

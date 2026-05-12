@@ -7,6 +7,8 @@
 #   uses cv2.xphoto.createSimpleWB().
 # - pyrealsense2 and tflite-runtime wheels are platform-specific; install on the
 #   robot/camera host that supports Intel RealSense and TFLite runtime wheels.
+# - TFLite GPU execution also requires a platform-specific delegate shared
+#   library (for example libtensorflowlite_gpu_delegate.so) available on the host.
 
 numpy==1.26.4
 pandas==2.2.2

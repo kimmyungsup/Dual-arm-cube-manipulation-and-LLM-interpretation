@@ -1,5 +1,7 @@
 import argparse
 import copy
+import os
+import time
 import cv2
 import numpy as np
 import open3d as o3d
@@ -38,6 +40,12 @@ FACE_GUIDE = {
     5: {"face": "B", "center": "BLUE",   "up": "WHITE (Up)"},
 }
 FACE_INDEX_TO_NAME = {idx: info["face"] for idx, info in FACE_GUIDE.items()}
+
+CUBENET_DETECTOR_WARMUP_RUNS = int(os.environ.get("CUBENET_DETECTOR_WARMUP_RUNS", "2"))
+CUBENET_POINT_COUNT = int(os.environ.get("CUBENET_POINT_COUNT", "800"))
+CUBENET_SDRSAC_ITERS = int(os.environ.get("CUBENET_SDRSAC_ITERS", "90"))
+CUBENET_SDRSAC_SUBSET_SIZE = int(os.environ.get("CUBENET_SDRSAC_SUBSET_SIZE", "5"))
+CUBENET_ICP_EVERY_N_FRAMES = max(1, int(os.environ.get("CUBENET_ICP_EVERY_N_FRAMES", "1")))
 
 
 def get_next_face_index(cube: CubeInteractor):
@@ -103,22 +111,45 @@ def _collect_face_data_map(cube: CubeInteractor):
 
 
 def main(detector_path: str, classifier_path: str, on_face_registered=None, on_capture_completed=None) -> None:
+    load_started = time.perf_counter()
+    print("[CUBENET][LOAD] loading color classifier...")
     classifier = KNNClassifier(classifier_path)
-    detector = TFLiteDetector(detector_path)
+    print("[CUBENET][LOAD] color classifier loaded")
 
+    print("[CUBENET][LOAD] loading TFLite detector...")
+    detector = TFLiteDetector(detector_path)
+    print(
+        f"[CUBENET][LOAD] TFLite detector loaded "
+        f"(delegate={getattr(detector, 'delegate', 'unknown')}, threads={getattr(detector, 'num_threads', 'unknown')})"
+    )
+
+    if CUBENET_DETECTOR_WARMUP_RUNS > 0:
+        warmup_started = time.perf_counter()
+        print(f"[CUBENET][LOAD] warming up detector ({CUBENET_DETECTOR_WARMUP_RUNS} runs)...")
+        detector.warmup(CUBENET_DETECTOR_WARMUP_RUNS)
+        print(f"[CUBENET][LOAD] detector warmup completed in {time.perf_counter() - warmup_started:.2f}s")
+
+    print("[CUBENET][LOAD] starting webcam...")
     cube = CubeInteractor()
     webcam = WebcamInteractor()
     intrinsic = webcam.intrinsic
+    print("[CUBENET][LOAD] webcam started")
 
+    print(f"[CUBENET][LOAD] preparing cube point cloud ({CUBENET_POINT_COUNT} points)...")
     mesh_cube = o3d.geometry.TriangleMesh.create_box(width=cube_size, height=cube_size, depth=cube_size)
     mesh_cube.translate(-np.array([cube_size / 2, cube_size / 2, cube_size / 2]))
-    cube_pcd = mesh_cube.sample_points_uniformly(number_of_points=1000)
+    cube_pcd = mesh_cube.sample_points_uniformly(number_of_points=CUBENET_POINT_COUNT)
     cube_pcd.estimate_normals(search_param=o3d.geometry.KDTreeSearchParamHybrid(radius=0.01, max_nn=30))
 
+    print(f"[CUBENET][LOAD] CubeNet models/resources loaded in {time.perf_counter() - load_started:.2f}s")
+    print("[CUBENET][LOAD] ready to process camera frames")
+
     do_init = True
+    frame_idx = 0
     last_announced_face_idx = None
 
     while True:
+        frame_idx += 1
         frame, depth = webcam.get_frame()
         if frame is None or depth is None:
             continue
@@ -150,8 +181,8 @@ def main(detector_path: str, classifier_path: str, on_face_registered=None, on_c
                     np.array(cube_pcd.normals),
                     0.4,
                     diameter,
-                    subset_size=5,
-                    num_iters=130,
+                    subset_size=CUBENET_SDRSAC_SUBSET_SIZE,
+                    num_iters=CUBENET_SDRSAC_ITERS,
                 )
                 pose = f_sdrsac.run()
             except Exception:
@@ -169,31 +200,32 @@ def main(detector_path: str, classifier_path: str, on_face_registered=None, on_c
 
             do_init = False
         else:
-            result = o3d.pipelines.registration.registration_icp(
-                pcd,
-                cube_pcd,
-                max_correspondence_distance=0.015,
-                init=np.linalg.inv(pose),
-                estimation_method=o3d.pipelines.registration.TransformationEstimationPointToPlane(),
-            )
-            result = o3d.pipelines.registration.registration_icp(
-                pcd,
-                cube_pcd,
-                max_correspondence_distance=0.01,
-                init=result.transformation,
-                estimation_method=o3d.pipelines.registration.TransformationEstimationPointToPoint(),
-            )
+            if frame_idx % CUBENET_ICP_EVERY_N_FRAMES == 0:
+                result = o3d.pipelines.registration.registration_icp(
+                    pcd,
+                    cube_pcd,
+                    max_correspondence_distance=0.015,
+                    init=np.linalg.inv(pose),
+                    estimation_method=o3d.pipelines.registration.TransformationEstimationPointToPlane(),
+                )
+                result = o3d.pipelines.registration.registration_icp(
+                    pcd,
+                    cube_pcd,
+                    max_correspondence_distance=0.01,
+                    init=result.transformation,
+                    estimation_method=o3d.pipelines.registration.TransformationEstimationPointToPoint(),
+                )
 
-            if result.fitness > 0.3 and result.inlier_rmse < 0.03:
-                pose = np.linalg.inv(result.transformation)
-                do_init = False
-            else:
-                do_init = True
+                if result.fitness > 0.3 and result.inlier_rmse < 0.03:
+                    pose = np.linalg.inv(result.transformation)
+                    do_init = False
+                else:
+                    do_init = True
 
-            cube_pcd_tr = copy.copy(cube_pcd).transform(pose)
-            flip_error = np.mean(np.array(cube_pcd_tr.points), axis=0)[-1] - np.mean(np.array(pcd.points), axis=0)[-1]
-            if flip_error < 0:
-                do_init = False
+                cube_pcd_tr = copy.copy(cube_pcd).transform(pose)
+                flip_error = np.mean(np.array(cube_pcd_tr.points), axis=0)[-1] - np.mean(np.array(pcd.points), axis=0)[-1]
+                if flip_error < 0:
+                    do_init = False
 
         colors_est = color_based_on_pose(frame, pose, intrinsic, cube_size)
         top, left, bot, right = position
