@@ -13,6 +13,7 @@ Output rule
 Preferred valid examples:
 {"commands":["init"]}
 {"commands":["lg"]}
+{"commands":["motion demo_pick"]}
 {"commands":["task 0.31000 0.25000 -0.40000 0.00000 0.00000 0.00000 0.30000 -0.25000 -0.40000 0.00000 0.00000 0.00000","lg","task 0.30000 0.25000 -0.40000 0.00000 0.00000 0.00000 0.30000 -0.25000 -0.40000 0.00000 0.00000 0.00000"]}
 {"commands":["none, joint 0.00000 0.00000 0.00000 0.00000 0.00000 0.00000 0.00000 0.00000 0.00000 0.00000 0.00000 0.00000 0.00000 0.00000 0.00000 0.00000 0.00000 0.00000 0.00000 0.00000, joint 0.00000 0.00000 0.00000 0.00000 0.00000 0.00000 0.00000 0.00000 0.00000 0.00000 0.00000 0.00000 0.00000 0.00000 0.00000 0.00000 0.00000 0.00000 0.00000 0.00000"]}
 
@@ -63,7 +64,22 @@ Meaning:
   - position: meter
   - rotation: radian
 
-5) Dual-hand joint command
+5) Custom motion command
+- Format:
+  "motion <motion_name_or_alias>"
+- These commands execute one row from custom_motion.csv.
+- The CSV row may be arm-only, hand-only, or both depending on motion_use_arm and motion_use_hand.
+
+Custom motion registry maintained by the user
+- Add your custom motions below manually after recording/editing custom_motion.csv.
+- Keep one line per motion in this exact style:
+  - alias: <alias>, name: <motion_name>, command: "motion <alias>", type: <arm_only|hand_only|arm_hand>, description: <short natural-language meaning>
+
+BEGIN_CUSTOM_MOTIONS
+- alias: demo_pick, name: demo_pick_motion, command: "motion demo_pick", type: arm_hand, description: example placeholder; replace with a real custom motion from custom_motion.csv
+END_CUSTOM_MOTIONS
+
+6) Dual-hand joint command
 - Format:
   "none, joint <20 floats>, joint <20 floats>"
 - Must contain exactly 20 floats for left hand and 20 floats for right hand.
@@ -71,7 +87,8 @@ Meaning:
 Priority rules
 - If the request is about normal grasping/releasing, ALWAYS use lg/lr/rg/rr.
 - Use distal grasp preset commands only when the user explicitly asks for distal-only or fingertip-specific grasping.
-- Do NOT generate joint arrays when lg/lr/rg/rr or a grasp preset can be used.
+- Do NOT generate joint arrays when lg/lr/rg/rr, a custom motion, or a grasp preset can be used.
+- If the user request matches a custom motion listed in BEGIN_CUSTOM_MOTIONS, output its "motion <alias>" command.
 
 State handling
 - The program will provide the current robot state.

@@ -221,8 +221,18 @@ last_hand_send_time = 0.0
 # Scenario record output files.
 SNAPSHOT_TXT_PATH = "scenario_records.txt"
 SNAPSHOT_CSV_PATH = "scenario_records.csv"
+CUSTOM_MOTION_CSV_PATH = os.path.join(SCRIPT_DIR, "custom_motion.csv")
 SCENARIO_EXAMPLE_PATH = "scenario_command_examples.txt"
 READY_CSV_PATH = os.path.join(SCRIPT_DIR, "scenario_records_ready.csv")
+
+CUSTOM_MOTION_METADATA_COLUMNS = [
+    "motion_name",
+    "motion_alias",
+    "motion_description",
+    "motion_use_arm",
+    "motion_use_hand",
+    "motion_tags",
+]
 
 # Scenario mode state.
 scenario_step_counter = 1
@@ -902,14 +912,148 @@ def append_snapshot_to_csv(record, path=SNAPSHOT_CSV_PATH):
         writer.writerow(record)
 
 
+def _read_csv_rows_and_fieldnames(path: str):
+    if not os.path.exists(path):
+        return [], []
+    with open(path, "r", newline="", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        return list(reader), list(reader.fieldnames or [])
+
+
+def append_dict_to_csv_with_header_union(record: dict, path: str, preferred_fieldnames=None):
+    """Append a row while preserving editable CSV headers and adding missing columns if needed."""
+    rows, existing_fieldnames = _read_csv_rows_and_fieldnames(path)
+    preferred_fieldnames = list(preferred_fieldnames or [])
+
+    fieldnames = []
+    for name in preferred_fieldnames + existing_fieldnames + list(record.keys()):
+        if name not in fieldnames:
+            fieldnames.append(name)
+
+    file_needs_rewrite = bool(existing_fieldnames) and fieldnames != existing_fieldnames
+    mode = "w" if file_needs_rewrite or not existing_fieldnames else "a"
+    with open(path, mode, newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
+        if mode == "w":
+            writer.writeheader()
+            for row in rows:
+                writer.writerow(row)
+        writer.writerow(record)
+
+
+def build_custom_motion_record(record: dict, label: str = ""):
+    """Add editable custom-motion metadata columns to a snapshot record."""
+    motion_name = label.strip() if label else record.get("label", "")
+    custom_record = {
+        "motion_name": motion_name,
+        "motion_alias": "",
+        "motion_description": "",
+        "motion_use_arm": "TRUE",
+        "motion_use_hand": "TRUE",
+        "motion_tags": "",
+    }
+    custom_record.update(record)
+    return custom_record
+
+
+def append_custom_motion_to_csv(record: dict, label: str = "", path: str = CUSTOM_MOTION_CSV_PATH):
+    custom_record = build_custom_motion_record(record, label=label)
+    preferred_fieldnames = CUSTOM_MOTION_METADATA_COLUMNS + [k for k in record.keys() if k not in CUSTOM_MOTION_METADATA_COLUMNS]
+    append_dict_to_csv_with_header_union(custom_record, path, preferred_fieldnames=preferred_fieldnames)
+
+
 def record_snapshot(label=""):
-    """Record one scenario snapshot to TXT and CSV."""
+    """Record one scenario snapshot to TXT, scenario CSV, and editable custom-motion CSV."""
     global scenario_step_counter
     record = build_snapshot_record(label=label)
     append_snapshot_to_txt(record)
     append_snapshot_to_csv(record)
-    print(f"[REC] scenario snapshot saved -> {SNAPSHOT_TXT_PATH} / {SNAPSHOT_CSV_PATH} (step={scenario_step_counter})")
+    append_custom_motion_to_csv(record, label=label)
+    print(
+        f"[REC] scenario snapshot saved -> {SNAPSHOT_TXT_PATH} / {SNAPSHOT_CSV_PATH} "
+        f"and custom motion -> {CUSTOM_MOTION_CSV_PATH} (step={scenario_step_counter})"
+    )
     scenario_step_counter += 1
+
+
+def _csv_bool(value, default: bool = True) -> bool:
+    if value is None or str(value).strip() == "":
+        return default
+    return str(value).strip().lower() in ("1", "true", "yes", "y", "on", "arm", "hand")
+
+
+def load_custom_motion_row(identifier: str, path: str = CUSTOM_MOTION_CSV_PATH):
+    """Load the most recent custom motion row matching name, alias, or label."""
+    ident = str(identifier).strip()
+    if not ident:
+        return None
+    rows, _ = _read_csv_rows_and_fieldnames(path)
+    for row in reversed(rows):
+        candidates = [
+            row.get("motion_alias", ""),
+            row.get("motion_name", ""),
+            row.get("label", ""),
+        ]
+        if any(ident == str(candidate).strip() for candidate in candidates if candidate is not None):
+            return row
+    return None
+
+
+def custom_motion_exists(identifier: str) -> bool:
+    return load_custom_motion_row(identifier) is not None
+
+
+def set_task_from_snapshot_row(row):
+    values = [
+        float(row["left_task_x"]),
+        float(row["left_task_y"]),
+        float(row["left_task_z"]),
+        float(row["left_task_roll"]),
+        float(row["left_task_pitch"]),
+        float(row["left_task_yaw"]),
+        float(row["right_task_x"]),
+        float(row["right_task_y"]),
+        float(row["right_task_z"]),
+        float(row["right_task_roll"]),
+        float(row["right_task_pitch"]),
+        float(row["right_task_yaw"]),
+    ]
+    set_task_from_values(values)
+
+
+def set_hand_from_snapshot_row(row):
+    global left_hand_target, right_hand_target
+    left_hand_target = np.array([float(row[f"left_hand_target_j{i}"]) for i in range(1, 21)], dtype=np.float32)
+    right_hand_target = np.array([float(row[f"right_hand_target_j{i}"]) for i in range(1, 21)], dtype=np.float32)
+
+
+def run_custom_motion(sock, identifier: str, verbose: bool = True, speed_scale: float = DEFAULT_SPEED_SCALE):
+    """Run one editable custom motion by motion_name, motion_alias, or label."""
+    row = load_custom_motion_row(identifier)
+    if row is None:
+        print(f"[ERR] custom motion not found: {identifier}")
+        return False
+
+    use_arm = _csv_bool(row.get("motion_use_arm"), default=True)
+    use_hand = _csv_bool(row.get("motion_use_hand"), default=True)
+    motion_name = row.get("motion_name") or row.get("label") or identifier
+    motion_alias = row.get("motion_alias", "")
+
+    if verbose:
+        alias_text = f" alias={motion_alias}" if motion_alias else ""
+        print(f"[CUSTOM] running motion '{motion_name}'{alias_text} use_arm={use_arm} use_hand={use_hand}")
+
+    if use_arm:
+        set_task_from_snapshot_row(row)
+        send_current_task(sock, verbose=verbose)
+        scaled_sleep(0.02, speed_scale)
+    if use_hand:
+        set_hand_from_snapshot_row(row)
+        send_current_hand(sock, verbose=verbose)
+        scaled_sleep(0.02, speed_scale)
+    if not use_arm and not use_hand:
+        print(f"[WARN] custom motion '{motion_name}' has both motion_use_arm and motion_use_hand disabled")
+    return True
 
 
 # =============================================================================
@@ -1728,6 +1872,13 @@ def validate_robot_command(cmd: str) -> str:
     s = cmd.strip()
     if s in ("init", "rest", "home", "ready", "quit") or s in READY_HAND_ACTIONS or s in DISTAL_GRASP_PRESET_ACTIONS:
         return s
+    if s.startswith("motion "):
+        identifier = s[len("motion "):].strip()
+        if custom_motion_exists(identifier):
+            return f"motion {identifier}"
+        raise ValueError(f"custom motion not found: {identifier}")
+    if custom_motion_exists(s):
+        return f"motion {s}"
     if s.startswith("task "):
         values = _parse_task_command(s)
         return "task " + " ".join(f"{x:.5f}" for x in values)
@@ -1742,7 +1893,12 @@ def validate_robot_command(cmd: str) -> str:
 def apply_robot_command_to_state(cmd: str):
     """Update local task/hand state to match a validated command string."""
     global left_task, right_task, left_hand_target, right_hand_target
-    if cmd in ("init", "rest", "home", "ready", "quit") or cmd in READY_HAND_ACTIONS or cmd in DISTAL_GRASP_PRESET_ACTIONS:
+    if (
+        cmd in ("init", "rest", "home", "ready", "quit")
+        or cmd in READY_HAND_ACTIONS
+        or cmd in DISTAL_GRASP_PRESET_ACTIONS
+        or cmd.startswith("motion ")
+    ):
         return
     if cmd.startswith("task "):
         values = _parse_task_command(cmd)
@@ -1803,6 +1959,9 @@ def dispatch_robot_command(sock, cmd: str, verbose: bool = True, speed_scale: fl
     if cmd in DISTAL_GRASP_PRESET_ACTIONS:
         run_named_grasp_preset(sock, cmd, verbose=verbose, speed_scale=speed_scale)
         return True
+
+    if cmd.startswith("motion "):
+        return run_custom_motion(sock, cmd[len("motion "):].strip(), verbose=verbose, speed_scale=speed_scale)
 
     apply_robot_command_to_state(cmd)
 
@@ -2089,13 +2248,14 @@ def execute_natural_language_command(sock, user_text: str, require_confirm: bool
 
     ok = dispatch_robot_command_sequence(sock, commands, verbose=True, speed_scale=speed_scale)
     if ok:
-        if any(cmd == "ready" or cmd.startswith("task ") for cmd in commands):
+        if any(cmd == "ready" or cmd.startswith("task ") or cmd.startswith("motion ") for cmd in commands):
             print_task_target()
         if any(
             cmd == "ready"
             or cmd in READY_HAND_ACTIONS
             or cmd in DISTAL_GRASP_PRESET_ACTIONS
             or cmd.startswith("none,")
+            or cmd.startswith("motion ")
             for cmd in commands
         ):
             print_hand_target()
@@ -2502,6 +2662,10 @@ def print_help():
   sendhand
       Send current hand target without modifying it
 
+  motion <name_or_alias>
+      Run a row from custom_motion.csv by motion_name, motion_alias, or label
+      The CSV row can set motion_use_arm / motion_use_hand
+
   task <12 floats>
       Set full task pose and send immediately
       Format: left xyz rpy + right xyz rpy
@@ -2537,7 +2701,8 @@ def print_help():
       Sync only the active hand target from feedback
 
   record [label]
-      Save current scenario snapshot to TXT/CSV
+      Save current scenario snapshot to TXT/CSV and custom_motion.csv
+      Edit custom_motion.csv columns: motion_name, motion_alias, motion_description, motion_use_arm, motion_use_hand
 
   scenarioexample
       Print current task/hand command example block
@@ -2697,6 +2862,34 @@ def main():
                 if ok:
                     side = READY_HAND_ACTIONS[cmd][0]
                     print_hand_target(side)
+            elif cmd == "motion":
+                if len(tokens) < 2:
+                    print("[ERR] motion command format: motion <name_or_alias> [speed_scale]")
+                    continue
+                speed_scale = DEFAULT_SPEED_SCALE
+                motion_tokens = tokens[1:]
+                try:
+                    speed_scale = float(tokens[-1])
+                    motion_tokens = tokens[1:-1]
+                except ValueError:
+                    pass
+                identifier = " ".join(motion_tokens).strip()
+                if not identifier:
+                    print("[ERR] motion command format: motion <name_or_alias> [speed_scale]")
+                    continue
+                ok = run_custom_motion(snd_sock, identifier, verbose=True, speed_scale=speed_scale)
+                if ok:
+                    print_task_target()
+                    print_hand_target()
+            elif custom_motion_exists(cmd):
+                if len(tokens) > 2:
+                    print(f"[ERR] custom motion alias format: {cmd} [speed_scale]")
+                    continue
+                speed_scale = parse_optional_speed_scale(tokens, 1)
+                ok = run_custom_motion(snd_sock, cmd, verbose=True, speed_scale=speed_scale)
+                if ok:
+                    print_task_target()
+                    print_hand_target()
             elif cmd == "sendtask":
                 send_current_task(snd_sock, verbose=True)
             elif cmd == "sendhand":
