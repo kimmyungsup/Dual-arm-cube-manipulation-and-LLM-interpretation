@@ -1,14 +1,29 @@
+import importlib
 import pickle
 from itertools import product
 import cv2 as cv
 from app.enums.colors import *
 import numpy as np
 
+
+def _patch_sklearn_distance_metric_pickle_aliases():
+    """Patch sklearn distance-metric names used by pickled KNN models across versions."""
+    dist_metrics = importlib.import_module("sklearn.metrics._dist_metrics")
+
+    # scikit-learn 1.3+ pickles may reference EuclideanDistance64, while older
+    # 1.2.x installations expose the same metric as EuclideanDistance.  Adding
+    # the alias before pickle.load keeps older environments from failing with:
+    #   Can't get attribute 'EuclideanDistance64' on sklearn.metrics._dist_metrics
+    if not hasattr(dist_metrics, "EuclideanDistance64") and hasattr(dist_metrics, "EuclideanDistance"):
+        setattr(dist_metrics, "EuclideanDistance64", getattr(dist_metrics, "EuclideanDistance"))
+
+
 class KNNClassifier:
     centers = 1 / 6, 3 / 6, 5 / 6
     patch_size = 8
 
     def __init__(self, model_path: str) -> None:
+        _patch_sklearn_distance_metric_pickle_aliases()
         with open(model_path, 'rb') as model_file:
             self.model = pickle.load(model_file)
 
