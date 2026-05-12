@@ -1811,6 +1811,77 @@ def dispatch_robot_command(sock, cmd: str, verbose: bool = True, speed_scale: fl
     return True
 
 
+
+def _extract_chat_completion_text(response) -> str:
+    """Extract text from an OpenAI chat-completions response object."""
+    choices = getattr(response, "choices", None)
+    if not choices:
+        return ""
+
+    first = choices[0]
+    if isinstance(first, dict):
+        message = first.get("message")
+    else:
+        message = getattr(first, "message", None)
+    if message is None:
+        return ""
+
+    if isinstance(message, dict):
+        content = message.get("content", "")
+    else:
+        content = getattr(message, "content", "")
+    if isinstance(content, str):
+        return content
+
+    if isinstance(content, list):
+        parts = []
+        for item in content:
+            if isinstance(item, dict):
+                text = item.get("text")
+                if text:
+                    parts.append(text)
+            else:
+                text = getattr(item, "text", None)
+                if text:
+                    parts.append(text)
+        return "".join(parts)
+
+    return str(content) if content else ""
+
+
+def call_openai_text_generation(prompt: str) -> str:
+    """Call the installed OpenAI SDK using Responses API when available, otherwise Chat Completions."""
+    client = OpenAI()
+
+    responses_api = getattr(client, "responses", None)
+    if responses_api is not None:
+        response = responses_api.create(
+            model=OPENAI_MODEL,
+            input=prompt,
+        )
+        return getattr(response, "output_text", "")
+
+    chat_api = getattr(client, "chat", None)
+    chat_completions = getattr(chat_api, "completions", None) if chat_api is not None else None
+    if chat_completions is not None:
+        response = chat_completions.create(
+            model=OPENAI_MODEL,
+            messages=[
+                {
+                    "role": "system",
+                    "content": "Return only the robot command JSON or legacy command format specified by the prompt.",
+                },
+                {"role": "user", "content": prompt},
+            ],
+        )
+        return _extract_chat_completion_text(response)
+
+    raise RuntimeError(
+        "installed openai package supports neither client.responses nor client.chat.completions. "
+        "Upgrade OpenAI SDK or install a compatible version."
+    )
+
+
 def request_llm_robot_command(user_text: str):
     """
     Call OpenAI API and return (validated_robot_commands, raw_llm_output).
@@ -1832,13 +1903,7 @@ def request_llm_robot_command(user_text: str):
         f"{user_text}\n"
     )
 
-    client = OpenAI()
-    response = client.responses.create(
-        model=OPENAI_MODEL,
-        input=prompt,
-    )
-
-    raw_output = response.output_text.strip()
+    raw_output = call_openai_text_generation(prompt).strip()
     validated = parse_llm_robot_commands(raw_output)
     return validated, raw_output
 
