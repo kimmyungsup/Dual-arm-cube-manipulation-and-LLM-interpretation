@@ -40,12 +40,44 @@ FACE_GUIDE = {
     5: {"face": "B", "center": "BLUE",   "up": "WHITE (Up)"},
 }
 FACE_INDEX_TO_NAME = {idx: info["face"] for idx, info in FACE_GUIDE.items()}
+CUBE_SOLVE_REFERENCE_POSE = "Hold the cube with WHITE center on top (U) and GREEN center facing front (F); RED is right (R)."
+CUBE_MOVE_NOTATION_HELP = {
+    "U": "rotate the Up/top face 90° clockwise",
+    "D": "rotate the Down/bottom face 90° clockwise",
+    "L": "rotate the Left face 90° clockwise",
+    "R": "rotate the Right face 90° clockwise",
+    "F": "rotate the Front face 90° clockwise",
+    "B": "rotate the Back face 90° clockwise",
+}
 
 CUBENET_DETECTOR_WARMUP_RUNS = int(os.environ.get("CUBENET_DETECTOR_WARMUP_RUNS", "2"))
 CUBENET_POINT_COUNT = int(os.environ.get("CUBENET_POINT_COUNT", "800"))
 CUBENET_SDRSAC_ITERS = int(os.environ.get("CUBENET_SDRSAC_ITERS", "90"))
 CUBENET_SDRSAC_SUBSET_SIZE = int(os.environ.get("CUBENET_SDRSAC_SUBSET_SIZE", "5"))
 CUBENET_ICP_EVERY_N_FRAMES = max(1, int(os.environ.get("CUBENET_ICP_EVERY_N_FRAMES", "1")))
+
+
+
+def describe_cube_solution(solution: str):
+    """Print a concise human guide for Kociemba cube move notation."""
+    print(f"[GUIDE] Solve reference pose: {CUBE_SOLVE_REFERENCE_POSE}")
+    if not solution:
+        print("[GUIDE] No cube manipulation sequence was returned.")
+        return
+
+    print("[GUIDE] Move notation: no suffix=90° clockwise, '=90° counter-clockwise, 2=180°.")
+    print("[GUIDE] Step-by-step manipulation guide:")
+    for step_idx, move in enumerate(solution.split(), start=1):
+        face = move[0]
+        suffix = move[1:]
+        base_text = CUBE_MOVE_NOTATION_HELP.get(face, f"rotate face {face}")
+        if suffix == "'":
+            action = base_text.replace("clockwise", "counter-clockwise")
+        elif suffix == "2":
+            action = base_text.replace("90° clockwise", "180°")
+        else:
+            action = base_text
+        print(f"[GUIDE]   {step_idx}. {move}: {action}")
 
 
 def get_next_face_index(cube: CubeInteractor):
@@ -263,6 +295,7 @@ def main(detector_path: str, classifier_path: str, on_face_registered=None, on_c
             for face_name in ["U", "R", "F", "D", "L", "B"]:
                 print(f"[GUIDE] {face_name}: {face_data_map.get(face_name)}")
             print(f"[GUIDE] Cube manipulation sequence: {solution}")
+            describe_cube_solution(solution)
             if callable(on_capture_completed):
                 try:
                     on_capture_completed(face_data_map, solution)

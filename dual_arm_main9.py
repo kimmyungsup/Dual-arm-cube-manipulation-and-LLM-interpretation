@@ -99,7 +99,12 @@ def _run_cubenet_worker(
             on_face_registered=on_face_registered,
             on_capture_completed=on_capture_completed,
         )
-        print("[INFO] CubeNet face-guide detection thread finished")
+        reference_pose = getattr(
+            cubenet_module,
+            "CUBE_SOLVE_REFERENCE_POSE",
+            "Hold the cube with WHITE center on top (U) and GREEN center facing front (F); RED is right (R).",
+        )
+        print(f"[INFO] CubeNet face-guide detection thread finished; solve reference pose: {reference_pose}")
     except Exception as e:
         print(f"[ERR] CubeNet face-guide runtime error: {e}")
 
@@ -1514,6 +1519,11 @@ def scenario_mode(sock):
             colors = face_data_map.get(face_name)
             print(f"  - {face_name}: {colors if colors else 'N/A'}")
         print(f"[SCENARIO][CUBENET] cube manipulation sequence: {solution}")
+        try:
+            import cubenet_with_face_guide as cubenet_module
+            cubenet_module.describe_cube_solution(solution)
+        except Exception as e:
+            print(f"[WARN] failed to print cube solution guide: {e}")
 
     start_cubenet_detection_if_needed(
         on_face_registered=on_face_registered,
