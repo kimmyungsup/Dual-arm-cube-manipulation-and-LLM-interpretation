@@ -1,5 +1,7 @@
 import argparse
 import copy
+import os
+import time
 import cv2
 import numpy as np
 import open3d as o3d
@@ -37,6 +39,13 @@ FACE_GUIDE = {
     4: {"face": "L", "center": "ORANGE", "up": "WHITE (Up)"},
     5: {"face": "B", "center": "BLUE",   "up": "WHITE (Up)"},
 }
+FACE_INDEX_TO_NAME = {idx: info["face"] for idx, info in FACE_GUIDE.items()}
+
+CUBENET_DETECTOR_WARMUP_RUNS = int(os.environ.get("CUBENET_DETECTOR_WARMUP_RUNS", "2"))
+CUBENET_POINT_COUNT = int(os.environ.get("CUBENET_POINT_COUNT", "800"))
+CUBENET_SDRSAC_ITERS = int(os.environ.get("CUBENET_SDRSAC_ITERS", "90"))
+CUBENET_SDRSAC_SUBSET_SIZE = int(os.environ.get("CUBENET_SDRSAC_SUBSET_SIZE", "5"))
+CUBENET_ICP_EVERY_N_FRAMES = max(1, int(os.environ.get("CUBENET_ICP_EVERY_N_FRAMES", "1")))
 
 
 def get_next_face_index(cube: CubeInteractor):
@@ -85,23 +94,62 @@ def draw_face_guide(frame: np.ndarray, cube: CubeInteractor) -> np.ndarray:
     return frame
 
 
-def main(detector_path: str, classifier_path: str) -> None:
-    classifier = KNNClassifier(classifier_path)
-    detector = TFLiteDetector(detector_path)
+def _face_colors_to_names(face_colors):
+    return [getattr(color, "name", str(color)) for color in face_colors]
 
+
+def _collect_face_data_map(cube: CubeInteractor):
+    face_data_map = {}
+    for face_idx in FACE_GUIDE_ORDER:
+        face_name = FACE_INDEX_TO_NAME.get(face_idx, str(face_idx))
+        face_colors = cube.faces[face_idx]
+        if face_colors is None:
+            face_data_map[face_name] = None
+        else:
+            face_data_map[face_name] = _face_colors_to_names(face_colors)
+    return face_data_map
+
+
+def main(detector_path: str, classifier_path: str, on_face_registered=None, on_capture_completed=None) -> None:
+    load_started = time.perf_counter()
+    print("[CUBENET][LOAD] loading color classifier...")
+    classifier = KNNClassifier(classifier_path)
+    print("[CUBENET][LOAD] color classifier loaded")
+
+    print("[CUBENET][LOAD] loading TFLite detector...")
+    detector = TFLiteDetector(detector_path)
+    print(
+        f"[CUBENET][LOAD] TFLite detector loaded "
+        f"(delegate={getattr(detector, 'delegate', 'unknown')}, threads={getattr(detector, 'num_threads', 'unknown')})"
+    )
+
+    if CUBENET_DETECTOR_WARMUP_RUNS > 0:
+        warmup_started = time.perf_counter()
+        print(f"[CUBENET][LOAD] warming up detector ({CUBENET_DETECTOR_WARMUP_RUNS} runs)...")
+        detector.warmup(CUBENET_DETECTOR_WARMUP_RUNS)
+        print(f"[CUBENET][LOAD] detector warmup completed in {time.perf_counter() - warmup_started:.2f}s")
+
+    print("[CUBENET][LOAD] starting webcam...")
     cube = CubeInteractor()
     webcam = WebcamInteractor()
     intrinsic = webcam.intrinsic
+    print("[CUBENET][LOAD] webcam started")
 
+    print(f"[CUBENET][LOAD] preparing cube point cloud ({CUBENET_POINT_COUNT} points)...")
     mesh_cube = o3d.geometry.TriangleMesh.create_box(width=cube_size, height=cube_size, depth=cube_size)
     mesh_cube.translate(-np.array([cube_size / 2, cube_size / 2, cube_size / 2]))
-    cube_pcd = mesh_cube.sample_points_uniformly(number_of_points=1000)
+    cube_pcd = mesh_cube.sample_points_uniformly(number_of_points=CUBENET_POINT_COUNT)
     cube_pcd.estimate_normals(search_param=o3d.geometry.KDTreeSearchParamHybrid(radius=0.01, max_nn=30))
 
+    print(f"[CUBENET][LOAD] CubeNet models/resources loaded in {time.perf_counter() - load_started:.2f}s")
+    print("[CUBENET][LOAD] ready to process camera frames")
+
     do_init = True
+    frame_idx = 0
     last_announced_face_idx = None
 
     while True:
+        frame_idx += 1
         frame, depth = webcam.get_frame()
         if frame is None or depth is None:
             continue
@@ -133,8 +181,8 @@ def main(detector_path: str, classifier_path: str) -> None:
                     np.array(cube_pcd.normals),
                     0.4,
                     diameter,
-                    subset_size=5,
-                    num_iters=130,
+                    subset_size=CUBENET_SDRSAC_SUBSET_SIZE,
+                    num_iters=CUBENET_SDRSAC_ITERS,
                 )
                 pose = f_sdrsac.run()
             except Exception:
@@ -152,42 +200,74 @@ def main(detector_path: str, classifier_path: str) -> None:
 
             do_init = False
         else:
-            result = o3d.pipelines.registration.registration_icp(
-                pcd,
-                cube_pcd,
-                max_correspondence_distance=0.015,
-                init=np.linalg.inv(pose),
-                estimation_method=o3d.pipelines.registration.TransformationEstimationPointToPlane(),
-            )
-            result = o3d.pipelines.registration.registration_icp(
-                pcd,
-                cube_pcd,
-                max_correspondence_distance=0.01,
-                init=result.transformation,
-                estimation_method=o3d.pipelines.registration.TransformationEstimationPointToPoint(),
-            )
+            if frame_idx % CUBENET_ICP_EVERY_N_FRAMES == 0:
+                result = o3d.pipelines.registration.registration_icp(
+                    pcd,
+                    cube_pcd,
+                    max_correspondence_distance=0.015,
+                    init=np.linalg.inv(pose),
+                    estimation_method=o3d.pipelines.registration.TransformationEstimationPointToPlane(),
+                )
+                result = o3d.pipelines.registration.registration_icp(
+                    pcd,
+                    cube_pcd,
+                    max_correspondence_distance=0.01,
+                    init=result.transformation,
+                    estimation_method=o3d.pipelines.registration.TransformationEstimationPointToPoint(),
+                )
 
-            if result.fitness > 0.3 and result.inlier_rmse < 0.03:
-                pose = np.linalg.inv(result.transformation)
-                do_init = False
-            else:
-                do_init = True
+                if result.fitness > 0.3 and result.inlier_rmse < 0.03:
+                    pose = np.linalg.inv(result.transformation)
+                    do_init = False
+                else:
+                    do_init = True
 
-            cube_pcd_tr = copy.copy(cube_pcd).transform(pose)
-            flip_error = np.mean(np.array(cube_pcd_tr.points), axis=0)[-1] - np.mean(np.array(pcd.points), axis=0)[-1]
-            if flip_error < 0:
-                do_init = False
+                cube_pcd_tr = copy.copy(cube_pcd).transform(pose)
+                flip_error = np.mean(np.array(cube_pcd_tr.points), axis=0)[-1] - np.mean(np.array(pcd.points), axis=0)[-1]
+                if flip_error < 0:
+                    do_init = False
 
         colors_est = color_based_on_pose(frame, pose, intrinsic, cube_size)
         top, left, bot, right = position
         colors = classifier.my_get_colors(colors_est)
 
+        previous_registered_count = sum(1 for f in cube.faces if f is not None)
         cube.register_face(colors, frame)
+        current_registered_count = sum(1 for f in cube.faces if f is not None)
+        if current_registered_count > previous_registered_count:
+            registered_face_idx = int(colors[4].value)
+            registered_face_name = FACE_INDEX_TO_NAME.get(registered_face_idx, str(registered_face_idx))
+            registered_colors = _face_colors_to_names(cube.faces[registered_face_idx])
+            print(
+                f"[GUIDE] Face confirmed: {registered_face_name} "
+                f"({current_registered_count}/6) -> {registered_colors}"
+            )
+            if callable(on_face_registered):
+                try:
+                    on_face_registered(
+                        registered_face_idx,
+                        registered_face_name,
+                        registered_colors,
+                        current_registered_count,
+                        6,
+                    )
+                except Exception as callback_error:
+                    print(f"[WARN] on_face_registered callback error: {callback_error}")
+
         if cube.is_solvable():
             solution = cube.solve()
+            face_data_map = _collect_face_data_map(cube)
             frame = draw_face_guide(frame, cube)
             webcam.show_frame(frame)
-            print(solution)
+            print("[GUIDE] All cube faces captured.")
+            for face_name in ["U", "R", "F", "D", "L", "B"]:
+                print(f"[GUIDE] {face_name}: {face_data_map.get(face_name)}")
+            print(f"[GUIDE] Cube manipulation sequence: {solution}")
+            if callable(on_capture_completed):
+                try:
+                    on_capture_completed(face_data_map, solution)
+                except Exception as callback_error:
+                    print(f"[WARN] on_capture_completed callback error: {callback_error}")
             break
 
         try:
