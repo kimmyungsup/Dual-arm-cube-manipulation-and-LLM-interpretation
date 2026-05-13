@@ -43,6 +43,9 @@ CUBENET_CLASSIFIER_PATH = os.path.join(SCRIPT_DIR, "assets", "classifier", "mode
 
 cubenet_thread = None
 cubenet_lock = threading.Lock()
+cubenet_face_position_lock = threading.Lock()
+cubenet_latest_face_position = None
+cubenet_face_position_records = []
 
 # =============================================================================
 # Optional OpenAI chat-mode integration
@@ -107,6 +110,52 @@ def _run_cubenet_worker(
         print(f"[INFO] CubeNet face-guide detection thread finished; solve reference pose: {reference_pose}")
     except Exception as e:
         print(f"[ERR] CubeNet face-guide runtime error: {e}")
+
+
+def store_cubenet_face_position(face_position: dict):
+    """Store the latest CubeNet face/cube position from scenario mode callbacks."""
+    global cubenet_latest_face_position
+    if not face_position:
+        return
+
+    record = dict(face_position)
+    with cubenet_face_position_lock:
+        cubenet_latest_face_position = record
+        cubenet_face_position_records.append(record)
+
+
+def get_latest_cubenet_face_position():
+    """Return a copy of the latest CubeNet camera-frame face position, if any."""
+    with cubenet_face_position_lock:
+        if cubenet_latest_face_position is None:
+            return None
+        return dict(cubenet_latest_face_position)
+
+
+def get_cubenet_face_position_records():
+    """Return copies of all CubeNet face position records captured during this process."""
+    with cubenet_face_position_lock:
+        return [dict(record) for record in cubenet_face_position_records]
+
+
+def format_cubenet_face_position(face_position: dict) -> str:
+    if not face_position:
+        return "N/A"
+    return (
+        f"face={face_position.get('face_name', 'N/A')} "
+        f"progress={face_position.get('progress', 'N/A')}/{face_position.get('total_faces', 'N/A')} "
+        "camera_xyz_m=("
+        f"x={float(face_position.get('camera_x_m', 0.0)):.4f}, "
+        f"y={float(face_position.get('camera_y_m', 0.0)):.4f}, "
+        f"z={float(face_position.get('camera_z_m', 0.0)):.4f}"
+        ") "
+        "roi_px=("
+        f"top={face_position.get('roi_top_px', 'N/A')}, "
+        f"left={face_position.get('roi_left_px', 'N/A')}, "
+        f"bottom={face_position.get('roi_bottom_px', 'N/A')}, "
+        f"right={face_position.get('roi_right_px', 'N/A')}"
+        ")"
+    )
 
 
 def start_cubenet_detection_if_needed(
@@ -1663,11 +1712,15 @@ def print_current_summary_for_scenario():
 
 def scenario_mode(sock):
     """Keyboard mode for scenario authoring and command example export."""
-    def on_face_registered(face_idx, face_name, color_names, progress, total_faces):
+    def on_face_registered(face_idx, face_name, color_names, progress, total_faces, face_position=None):
+        if face_position is not None:
+            store_cubenet_face_position(face_position)
         print(
             f"[SCENARIO][CUBENET] registered face {face_name} (idx={face_idx}) "
             f"{progress}/{total_faces} -> {color_names}"
         )
+        if face_position is not None:
+            print(f"[SCENARIO][CUBENET] stored face position: {format_cubenet_face_position(face_position)}")
         print("[SCENARIO][CUBENET] running inter-face test grasp motions...")
         run_named_grasp_preset(sock, "left_grasp_off", verbose=True, speed_scale=DEFAULT_SPEED_SCALE)
         run_named_grasp_preset(sock, "right_grasp_on", verbose=True, speed_scale=DEFAULT_SPEED_SCALE)

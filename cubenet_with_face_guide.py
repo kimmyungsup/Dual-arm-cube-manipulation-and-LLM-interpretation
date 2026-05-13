@@ -1,5 +1,7 @@
 import argparse
 import copy
+import csv
+import inspect
 import os
 import time
 import cv2
@@ -16,6 +18,11 @@ from fast_sdrsac import *
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_DETECTOR_PATH = os.path.join(SCRIPT_DIR, "assets", "detector", "model.tflite")
 DEFAULT_CLASSIFIER_PATH = os.path.join(SCRIPT_DIR, "assets", "classifier", "model.knn")
+DEFAULT_FACE_POSITION_LOG_PATH = os.environ.get(
+    "CUBENET_FACE_POSITION_LOG_PATH",
+    os.path.join(SCRIPT_DIR, "cubenet_face_positions.csv"),
+)
+CUBENET_FACE_POSITION_RECORDS = []
 
 # 입력 순서: U, R, F, D, L, B
 # 면 (Face)    센터 색상 (예시)    해당 면의 '위(Up)' 방향에 있어야 할 색상
@@ -146,6 +153,112 @@ def _collect_face_data_map(cube: CubeInteractor):
     return face_data_map
 
 
+def _build_face_position_record(
+    face_idx: int,
+    face_name: str,
+    progress: int,
+    total_faces: int,
+    pose: np.ndarray,
+    roi_px: tuple[int, int, int, int],
+    detection_score: float,
+):
+    """Build a serializable cube-center position record in the camera coordinate frame."""
+    translation = np.asarray(pose[:3, 3], dtype=float).reshape(3)
+    top, left, bot, right = roi_px
+    return {
+        "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "face_idx": int(face_idx),
+        "face_name": face_name,
+        "progress": int(progress),
+        "total_faces": int(total_faces),
+        "camera_x_m": float(translation[0]),
+        "camera_y_m": float(translation[1]),
+        "camera_z_m": float(translation[2]),
+        "roi_top_px": int(top),
+        "roi_left_px": int(left),
+        "roi_bottom_px": int(bot),
+        "roi_right_px": int(right),
+        "detection_score": float(detection_score),
+    }
+
+
+def _append_face_position_record(record: dict, path: str = DEFAULT_FACE_POSITION_LOG_PATH) -> None:
+    CUBENET_FACE_POSITION_RECORDS.append(record.copy())
+    if not path:
+        return
+
+    try:
+        directory = os.path.dirname(path)
+        if directory:
+            os.makedirs(directory, exist_ok=True)
+        file_exists = os.path.exists(path)
+        fieldnames = list(record.keys())
+        with open(path, "a", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            if not file_exists:
+                writer.writeheader()
+            writer.writerow(record)
+    except Exception as e:
+        print(f"[WARN] failed to save CubeNet face position record to {path}: {e}")
+
+
+def _format_face_position_record(record: dict) -> str:
+    return (
+        "camera_xyz_m=("
+        f"x={record['camera_x_m']:.4f}, "
+        f"y={record['camera_y_m']:.4f}, "
+        f"z={record['camera_z_m']:.4f}"
+        ") "
+        "roi_px=("
+        f"top={record['roi_top_px']}, "
+        f"left={record['roi_left_px']}, "
+        f"bottom={record['roi_bottom_px']}, "
+        f"right={record['roi_right_px']}"
+        ") "
+        f"score={record['detection_score']:.3f}"
+    )
+
+
+def _callback_accepts_face_position(callback) -> bool:
+    try:
+        signature = inspect.signature(callback)
+    except (TypeError, ValueError):
+        return True
+
+    positional_count = 0
+    for parameter in signature.parameters.values():
+        if parameter.kind == inspect.Parameter.VAR_POSITIONAL:
+            return True
+        if parameter.kind == inspect.Parameter.VAR_KEYWORD:
+            return True
+        if parameter.name == "face_position":
+            return True
+        if parameter.kind in (inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD):
+            positional_count += 1
+    return positional_count >= 6
+
+
+def _notify_face_registered(
+    callback,
+    face_idx: int,
+    face_name: str,
+    color_names: list,
+    progress: int,
+    total_faces: int,
+    face_position: dict,
+) -> None:
+    if not callable(callback):
+        return
+
+    try:
+        if _callback_accepts_face_position(callback):
+            callback(face_idx, face_name, color_names, progress, total_faces, face_position)
+        else:
+            callback(face_idx, face_name, color_names, progress, total_faces)
+    except Exception as callback_error:
+        print(f"[WARN] on_face_registered callback error: {callback_error}")
+
+
 def main(detector_path: str, classifier_path: str, on_face_registered=None, on_capture_completed=None) -> None:
     load_started = time.perf_counter()
     print("[CUBENET][LOAD] loading color classifier...")
@@ -274,21 +387,31 @@ def main(detector_path: str, classifier_path: str, on_face_registered=None, on_c
             registered_face_idx = int(colors[4].value)
             registered_face_name = FACE_INDEX_TO_NAME.get(registered_face_idx, str(registered_face_idx))
             registered_colors = _face_colors_to_names(cube.faces[registered_face_idx])
+            face_position_record = _build_face_position_record(
+                registered_face_idx,
+                registered_face_name,
+                current_registered_count,
+                6,
+                pose,
+                position,
+                detection.score,
+            )
+            _append_face_position_record(face_position_record)
             print(
                 f"[GUIDE] Face confirmed: {registered_face_name} "
                 f"({current_registered_count}/6) -> {registered_colors}"
             )
-            if callable(on_face_registered):
-                try:
-                    on_face_registered(
-                        registered_face_idx,
-                        registered_face_name,
-                        registered_colors,
-                        current_registered_count,
-                        6,
-                    )
-                except Exception as callback_error:
-                    print(f"[WARN] on_face_registered callback error: {callback_error}")
+            print(f"[GUIDE] Face position: {_format_face_position_record(face_position_record)}")
+            print(f"[GUIDE] Face position saved: {DEFAULT_FACE_POSITION_LOG_PATH}")
+            _notify_face_registered(
+                on_face_registered,
+                registered_face_idx,
+                registered_face_name,
+                registered_colors,
+                current_registered_count,
+                6,
+                face_position_record,
+            )
 
         if cube.is_solvable():
             solution = cube.solve()
