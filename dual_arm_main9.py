@@ -753,10 +753,12 @@ def run_named_grasp_preset(sock, name: str, verbose: bool = True, speed_scale: f
 
 
 READY_HAND_ACTIONS = {
-    "lg": ("left", True, "left grasp"),
-    "lr": ("left", False, "left release"),
-    "rg": ("right", True, "right grasp"),
-    "rr": ("right", False, "right release"),
+    "lg": ("left", "grasp", "left grasp"),
+    "lr": ("left", "release", "left release"),
+    "le": ("left", "extend", "left extend"),
+    "rg": ("right", "grasp", "right grasp"),
+    "rr": ("right", "release", "right release"),
+    "re": ("right", "extend", "right extend"),
 }
 
 
@@ -780,12 +782,12 @@ def apply_grouped_flex_to_hand_pose(side: str, hand_pose, step: float, count: in
 
 def set_ready_hand_action_target(
     side: str,
-    grasp: bool,
+    mode: str,
     path: str = READY_CSV_PATH,
     step: float = None,
     count: int = READY_GRASP_GROUPED_FLEX_COUNT,
 ):
-    """Set one hand to ready release or ready + grouped-flex grasp while leaving arms untouched."""
+    """Set one hand to ready release, grasp, or extend while leaving arms untouched."""
     global left_hand_target, right_hand_target
 
     state = load_ready_state_from_csv(path)
@@ -794,15 +796,25 @@ def set_ready_hand_action_target(
 
     ready_key = f"{side}_hand_target"
     ready_hand = state[ready_key].copy()
-    if grasp:
+    action_step = hand_step if step is None else step
+    if mode == "grasp":
         next_hand = apply_grouped_flex_to_hand_pose(
             side,
             ready_hand,
-            hand_step if step is None else step,
+            action_step,
             count=count,
         )
-    else:
+    elif mode == "extend":
+        next_hand = apply_grouped_flex_to_hand_pose(
+            side,
+            ready_hand,
+            -action_step,
+            count=count,
+        )
+    elif mode == "release":
         next_hand = ready_hand
+    else:
+        raise ValueError("mode must be 'grasp', 'release', or 'extend'")
 
     if side == "left":
         left_hand_target = next_hand
@@ -815,18 +827,22 @@ def set_ready_hand_action_target(
 
 
 def run_ready_hand_action(sock, action: str, verbose: bool = True, speed_scale: float = DEFAULT_SPEED_SCALE):
-    """Run lg/lr/rg/rr ready-based hand-only grasp/release actions."""
+    """Run ready-based hand-only grasp/release/extend actions."""
     if action not in READY_HAND_ACTIONS:
         raise ValueError(f"unknown ready hand action: {action}")
 
-    side, grasp, label = READY_HAND_ACTIONS[action]
-    ok = set_ready_hand_action_target(side, grasp)
+    side, mode, label = READY_HAND_ACTIONS[action]
+    ok = set_ready_hand_action_target(side, mode)
     if not ok:
         return False
 
     if verbose:
-        mode = "ready + grouped flex x3" if grasp else "ready hand pose"
-        print(f"[INFO] {label} ({action}) -> {mode}; arm targets unchanged")
+        mode_text = {
+            "grasp": "ready + grouped flex x3",
+            "release": "ready hand pose",
+            "extend": "ready + grouped extend x3",
+        }[mode]
+        print(f"[INFO] {label} ({action}) -> {mode_text}; arm targets unchanged")
 
     send_current_hand(sock, verbose=verbose)
     scaled_sleep(0.02, speed_scale)
@@ -1945,7 +1961,7 @@ def dispatch_robot_command(sock, cmd: str, verbose: bool = True, speed_scale: fl
     - ready: load CSV state and send task + hand
     - task: update local state and send task
     - hand: update local state and send hand
-    - lg/lr/rg/rr: ready-based hand-only grasp/release
+    - lg/lr/le/rg/rr/re: ready-based hand-only grasp/release/extend
     - init/rest/home/quit: forward as raw command
     """
     cmd = validate_robot_command(cmd)
@@ -2702,9 +2718,11 @@ def print_help():
       Distal-only grasp presets for each hand
       Only the last 2 joints of each finger are modified
 
-  lg / lr / rg / rr
-      Ready-based hand-only actions: left grasp/release, right grasp/release
-      Grasp = ready hand pose + grouped flex x3; release = ready hand pose
+  lg / lr / le / rg / rr / re
+      Ready-based hand-only actions: left/right grasp, release, extend
+      Grasp = ready hand pose + grouped flex x3
+      Release = ready hand pose
+      Extend = ready hand pose + grouped extend x3 (opposite direction of grasp)
       Arm targets are not changed
 
   sendtask

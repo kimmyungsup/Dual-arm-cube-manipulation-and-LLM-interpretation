@@ -13,6 +13,7 @@ Output rule
 Preferred valid examples:
 {"commands":["init"]}
 {"commands":["lg"]}
+{"commands":["le"]}
 {"commands":["motion demo_pick"]}
 {"commands":["task 0.31000 0.25000 -0.40000 0.00000 0.00000 0.00000 0.30000 -0.25000 -0.40000 0.00000 0.00000 0.00000","lg","task 0.30000 0.25000 -0.40000 0.00000 0.00000 0.00000 0.30000 -0.25000 -0.40000 0.00000 0.00000 0.00000"]}
 {"commands":["none, joint 0.00000 0.00000 0.00000 0.00000 0.00000 0.00000 0.00000 0.00000 0.00000 0.00000 0.00000 0.00000 0.00000 0.00000 0.00000 0.00000 0.00000 0.00000 0.00000 0.00000, joint 0.00000 0.00000 0.00000 0.00000 0.00000 0.00000 0.00000 0.00000 0.00000 0.00000 0.00000 0.00000 0.00000 0.00000 0.00000 0.00000 0.00000 0.00000 0.00000 0.00000"]}
@@ -29,22 +30,27 @@ Allowed commands
 - "ready"
 - "quit"
 
-2) Ready-based hand-only grasp/release commands (highest priority for normal grasp/release)
+2) Ready-based hand-only grasp/release/extend commands (highest priority for normal hand open/close requests)
 - "lg" = left grasp
-- "lr" = left release
+- "lr" = left release / return to ready hand pose
+- "le" = left extend / open wider than ready pose
 - "rg" = right grasp
-- "rr" = right release
+- "rr" = right release / return to ready hand pose
+- "re" = right extend / open wider than ready pose
 
 Meaning:
 - These commands move only the hand joints and leave both arm targets unchanged.
 - Grasp starts from the stored ready hand pose and applies grouped flex 3 times.
 - Release returns that hand to the stored ready hand pose.
+- Extend starts from the stored ready hand pose and applies grouped extend 3 times, opposite the grasp direction.
 
 Mapping rules:
 - "왼손 잡아" / "왼손 파지" → "lg"
 - "왼손 놓아" / "왼손 복귀" → "lr"
+- "왼손 벌려" / "왼손 확장" / "왼손 펴" → "le"
 - "오른손 잡아" / "오른손 파지" → "rg"
 - "오른손 놓아" / "오른손 복귀" → "rr"
+- "오른손 벌려" / "오른손 확장" / "오른손 펴" → "re"
 
 3) Distal grasp preset commands (use only when distal-only/finger-tip grasp is explicitly requested)
 - "left_grasp_on"
@@ -85,9 +91,9 @@ END_CUSTOM_MOTIONS
 - Must contain exactly 20 floats for left hand and 20 floats for right hand.
 
 Priority rules
-- If the request is about normal grasping/releasing, ALWAYS use lg/lr/rg/rr.
+- If the request is about normal grasping/releasing/extending/opening, ALWAYS use lg/lr/le/rg/rr/re.
 - Use distal grasp preset commands only when the user explicitly asks for distal-only or fingertip-specific grasping.
-- Do NOT generate joint arrays when lg/lr/rg/rr, a custom motion, or a grasp preset can be used.
+- Do NOT generate joint arrays when lg/lr/le/rg/rr/re, a custom motion, or a grasp preset can be used.
 - If the user request matches a custom motion listed in BEGIN_CUSTOM_MOTIONS, output its "motion <alias>" command.
 
 State handling
