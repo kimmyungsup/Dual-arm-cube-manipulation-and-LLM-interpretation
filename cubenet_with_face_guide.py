@@ -13,6 +13,10 @@ from app.utils import *
 from app.webcam import *
 from fast_sdrsac import *
 
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+DEFAULT_DETECTOR_PATH = os.path.join(SCRIPT_DIR, "assets", "detector", "model.tflite")
+DEFAULT_CLASSIFIER_PATH = os.path.join(SCRIPT_DIR, "assets", "classifier", "model.knn")
+
 # 입력 순서: U, R, F, D, L, B
 # 면 (Face)    센터 색상 (예시)    해당 면의 '위(Up)' 방향에 있어야 할 색상
 # U (Up)       흰색               파란색 (Back)
@@ -321,10 +325,60 @@ def main(detector_path: str, classifier_path: str, on_face_registered=None, on_c
         webcam.await_input()
 
 
-if __name__ == '__main__':
-    parser = argparse.ArgumentParser()
-    parser.add_argument('-d', '--detector_path', required=True)
-    parser.add_argument('-c', '--classifier_path', required=True)
 
-    args = parser.parse_args()
-    main(args.detector_path, args.classifier_path)
+def _validate_model_path(path: str, label: str) -> bool:
+    if os.path.exists(path):
+        return True
+    print(f"[ERR] CubeNet {label} model not found: {path}")
+    return False
+
+
+def run_standalone(detector_path: str = DEFAULT_DETECTOR_PATH, classifier_path: str = DEFAULT_CLASSIFIER_PATH) -> int:
+    """Run the face-guide detector with the same default assets/logs as dual_arm_main9.py v mode."""
+    print("[INFO] CubeNet face-guide detection thread started")
+    print(f"[INFO] detector_path   = {detector_path}")
+    print(f"[INFO] classifier_path = {classifier_path}")
+
+    if not _validate_model_path(detector_path, "detector"):
+        return 1
+    if not _validate_model_path(classifier_path, "classifier"):
+        return 1
+
+    try:
+        main(detector_path, classifier_path)
+    except KeyboardInterrupt:
+        print("[INFO] CubeNet face-guide interrupted by user")
+        return 130
+    except Exception as e:
+        print(f"[ERR] CubeNet face-guide runtime error: {e}")
+        return 1
+
+    print(f"[INFO] CubeNet face-guide detection thread finished; solve reference pose: {CUBE_SOLVE_REFERENCE_POSE}")
+    return 0
+
+
+def build_arg_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description=(
+            "Run CubeNet face-guide detection. If no model paths are provided, "
+            "the same default assets used by dual_arm_main9.py scenario mode are used."
+        )
+    )
+    parser.add_argument(
+        '-d',
+        '--detector_path',
+        default=DEFAULT_DETECTOR_PATH,
+        help=f"TFLite detector model path (default: {DEFAULT_DETECTOR_PATH})",
+    )
+    parser.add_argument(
+        '-c',
+        '--classifier_path',
+        default=DEFAULT_CLASSIFIER_PATH,
+        help=f"KNN color classifier path (default: {DEFAULT_CLASSIFIER_PATH})",
+    )
+    return parser
+
+
+if __name__ == '__main__':
+    args = build_arg_parser().parse_args()
+    raise SystemExit(run_standalone(args.detector_path, args.classifier_path))
