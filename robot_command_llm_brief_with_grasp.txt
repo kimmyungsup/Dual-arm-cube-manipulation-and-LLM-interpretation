@@ -82,7 +82,16 @@ Custom motion registry maintained by the user
   - alias: <alias>, name: <motion_name>, command: "motion <alias>", type: <arm_only|hand_only|arm_hand>, description: <short natural-language meaning>
 
 BEGIN_CUSTOM_MOTIONS
-- alias: demo_pick, name: demo_pick_motion, command: "motion demo_pick", type: arm_hand, description: example placeholder; replace with a real custom motion from custom_motion.csv
+- alias: lpg, name: left_pre_grasp, command: "motion lpg", type: arm_only, description: 왼팔만 기존 left_grasp 접근 위치로 이동하고 손은 현재 상태를 유지한다.
+- alias: lgp, name: left_grasp_pose, command: "motion lgp", type: arm_hand, description: 왼팔 접근 위치와 왼손 파지 pose를 함께 적용한다.
+- alias: llift, name: left_lift_pose, command: "motion llift", type: arm_only, description: 왼손 파지 상태를 유지한 채 왼팔만 약 8cm 들어올린다.
+- alias: lrot, name: left_rotate_pose, command: "motion lrot", type: arm_only, description: 왼팔로 큐브를 회전/재지향하는 pose를 적용한다.
+- alias: lrelp, name: left_release_pose, command: "motion lrelp", type: hand_only, description: 왼손만 ready 손 target으로 복귀해 release/open한다.
+- alias: rpg, name: right_pre_grasp, command: "motion rpg", type: arm_only, description: 오른팔만 좌우 반전 접근 위치로 이동하고 손은 현재 상태를 유지한다.
+- alias: rgp, name: right_grasp_pose, command: "motion rgp", type: arm_hand, description: 오른팔 접근 위치와 오른손 파지 pose를 함께 적용한다.
+- alias: rrot, name: right_rotate_pose, command: "motion rrot", type: arm_only, description: 오른팔로 큐브를 회전/재지향하는 pose를 적용한다.
+- alias: cshow, name: cube_show_to_camera, command: "motion cshow", type: arm_only, description: CubeNet 촬영을 위해 큐브를 카메라에 보여주는 pose를 적용한다.
+- alias: cl2r, name: cube_transfer_left_to_right, command: "motion cl2r", type: arm_hand, description: 왼손 파지 위치와 오른손 수신 위치를 함께 구성하는 좌->우 전달 중간 pose를 적용한다.
 END_CUSTOM_MOTIONS
 
 6) Dual-hand joint command
