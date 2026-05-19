@@ -76,6 +76,9 @@ VOICE_CONTINUOUS_MODE = False
 VOICE_CONFIRM_MODE = False
 SEQUENCE_COMMAND_DELAY = float(os.environ.get("SEQUENCE_COMMAND_DELAY", "2.0"))
 LLM_SPEC_PATH = os.path.join(SCRIPT_DIR, "robot_command_llm_brief_with_grasp.txt")
+CHAT_CAM_PREFIX = "[cam]"
+CHAT_CAM_IMAGE_PATH = os.path.join(SCRIPT_DIR, "chat_camera_latest.jpg")
+CHAT_CAM_PREVIEW_WINDOW = "chat-camera-preview"
 
 
 
@@ -2087,7 +2090,74 @@ def _extract_chat_completion_text(response) -> str:
     return str(content) if content else ""
 
 
-def call_openai_text_generation(prompt: str) -> str:
+def _build_openai_user_input(prompt: str, cam_image_b64: Optional[str] = None):
+    if not cam_image_b64:
+        return prompt
+    return [
+        {"type": "input_text", "text": prompt},
+        {"type": "input_image", "image_url": f"data:image/jpeg;base64,{cam_image_b64}"},
+    ]
+
+
+def _build_chat_completion_user_content(prompt: str, cam_image_b64: Optional[str] = None):
+    if not cam_image_b64:
+        return prompt
+    return [
+        {"type": "text", "text": prompt},
+        {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{cam_image_b64}"}},
+    ]
+
+
+def capture_chat_camera_image(image_path: str = CHAT_CAM_IMAGE_PATH):
+    """Capture one RealSense color frame for [cam] chat requests, save preview, and return base64 JPEG."""
+    import base64
+    import cv2
+    import pyrealsense2 as rs
+
+    pipeline = rs.pipeline()
+    config = rs.config()
+    config.enable_stream(rs.stream.color, 640, 480, rs.format.bgr8, 30)
+
+    preview_opened = False
+    try:
+        pipeline.start(config)
+        for _ in range(15):
+            pipeline.wait_for_frames()
+        frames = pipeline.wait_for_frames()
+        color_frame = frames.get_color_frame()
+        if not color_frame:
+            raise RuntimeError("failed to get color frame from camera")
+
+        image = np.asanyarray(color_frame.get_data())
+        ok, encoded = cv2.imencode('.jpg', image)
+        if not ok:
+            raise RuntimeError("failed to encode camera frame as jpeg")
+
+        with open(image_path, 'wb') as f:
+            f.write(encoded.tobytes())
+
+        cv2.imshow(CHAT_CAM_PREVIEW_WINDOW, image)
+        cv2.waitKey(1)
+        preview_opened = True
+
+        image_b64 = base64.b64encode(encoded.tobytes()).decode('utf-8')
+        print(f"[CHAT][CAM] captured image saved: {image_path}")
+        print(f"[CHAT][CAM] preview window: {CHAT_CAM_PREVIEW_WINDOW}")
+        return image_b64, image_path
+    finally:
+        pipeline.stop()
+        if preview_opened:
+            cv2.destroyWindow(CHAT_CAM_PREVIEW_WINDOW)
+
+
+def parse_chat_camera_request(user_text: str):
+    s = user_text.strip()
+    if not s.lower().startswith(CHAT_CAM_PREFIX):
+        return False, s
+    return True, s[len(CHAT_CAM_PREFIX):].strip()
+
+
+def call_openai_text_generation(prompt: str, cam_image_b64: Optional[str] = None) -> str:
     """Call the installed OpenAI SDK using Responses API when available, otherwise Chat Completions."""
     client = OpenAI()
 
@@ -2095,7 +2165,7 @@ def call_openai_text_generation(prompt: str) -> str:
     if responses_api is not None:
         response = responses_api.create(
             model=OPENAI_MODEL,
-            input=prompt,
+            input=_build_openai_user_input(prompt, cam_image_b64=cam_image_b64),
         )
         return getattr(response, "output_text", "")
 
@@ -2109,7 +2179,7 @@ def call_openai_text_generation(prompt: str) -> str:
                     "role": "system",
                     "content": "Return only the robot command JSON or legacy command format specified by the prompt.",
                 },
-                {"role": "user", "content": prompt},
+                {"role": "user", "content": _build_chat_completion_user_content(prompt, cam_image_b64=cam_image_b64)},
             ],
         )
         return _extract_chat_completion_text(response)
@@ -2120,7 +2190,7 @@ def call_openai_text_generation(prompt: str) -> str:
     )
 
 
-def request_llm_robot_command(user_text: str):
+def request_llm_robot_command(user_text: str, cam_image_b64: Optional[str] = None):
     """
     Call OpenAI API and return (validated_robot_commands, raw_llm_output).
     """
@@ -2141,7 +2211,7 @@ def request_llm_robot_command(user_text: str):
         f"{user_text}\n"
     )
 
-    raw_output = call_openai_text_generation(prompt).strip()
+    raw_output = call_openai_text_generation(prompt, cam_image_b64=cam_image_b64).strip()
     validated = parse_llm_robot_commands(raw_output)
     return validated, raw_output
 
@@ -2157,6 +2227,7 @@ def chat_mode(sock):
     print(f"[INFO] model = {OPENAI_MODEL}")
     print(f"[INFO] spec  = {LLM_SPEC_PATH}")
     print('[INFO] type natural-language commands. type "exit" to leave chat mode.')
+    print('[INFO] prefix with [cam] to attach a live camera image. example: [cam] move the left arm above the cube.')
 
     while True:
         user_text = input("chat> ").strip()
@@ -2164,9 +2235,21 @@ def chat_mode(sock):
             continue
         if user_text.lower() in ("exit", "quit", "back"):
             print("[INFO] chat mode exited")
+            return True
 
         try:
-            ok = execute_natural_language_command(sock, user_text)
+            use_cam, prompt_text = parse_chat_camera_request(user_text)
+            cam_image_b64 = None
+            if use_cam:
+                if not prompt_text:
+                    print('[ERR] [cam] request is empty. example: [cam] move the left arm above the cube.')
+                    continue
+                cam_image_b64, _ = capture_chat_camera_image()
+                print('[CHAT][CAM] sending camera image + robot description to LLM...')
+            else:
+                prompt_text = user_text
+
+            ok = execute_natural_language_command(sock, prompt_text, cam_image_b64=cam_image_b64)
             if not ok:
                 return False
         except Exception as e:
@@ -2291,7 +2374,7 @@ def transcribe_voice_audio(audio, sample_rate: int) -> str:
     return text.strip()
 
 
-def execute_natural_language_command(sock, user_text: str, require_confirm: bool = False, speed_scale: float = DEFAULT_SPEED_SCALE):
+def execute_natural_language_command(sock, user_text: str, require_confirm: bool = False, speed_scale: float = DEFAULT_SPEED_SCALE, cam_image_b64: Optional[str] = None):
     """
     Shared helper used by text chat mode and voice mode.
     Prints the interpreted sentence and action command before execution.
@@ -2303,7 +2386,7 @@ def execute_natural_language_command(sock, user_text: str, require_confirm: bool
 
     print(f"[USER TEXT] {user_text}")
 
-    commands, raw = request_llm_robot_command(user_text)
+    commands, raw = request_llm_robot_command(user_text, cam_image_b64=cam_image_b64)
     print(f'[LLM RAW] {raw}')
     print(f'[ACTION COUNT] {len(commands)}')
     for idx, cmd in enumerate(commands, start=1):
