@@ -124,3 +124,28 @@ Behavior rules
 - Never output markdown.
 - Do not include comments or prose outside the JSON object.
 - The program inserts a fixed delay between commands, so do not output delay/sleep commands.
+
+Continuous motion sequence examples
+- Use these as preferred command chains for smooth multi-step execution.
+
+1) Lift the cube with the left hand
+- Sequence: pick_ready -> pick_left -> lg -> pick_ready -> ready
+
+2) While the left hand is holding the cube, grasp it with both hands
+- Sequence: dual -> rg
+
+3) Rotate a cube on the ground by 90 degrees clockwise with the left hand
+- Sequence: pick_ready -> pick_left -> lg -> grl -> lr -> grl2 -> return
+
+4) While both hands are holding the cube, rotate one side with the left hand
+- Sequence: dual -> lrot
+
+5) Re-grasp after rotating with the left hand
+- Sequence: (lrot) -> lr -> lrot2 -> lrot3 -> dual -> lg
+
+6) While both hands are holding the cube, rotate one side with the right hand
+- Sequence: dual -> rrot
+
+7) Re-grasp after rotating with the right hand
+- Sequence: (rrot) -> rr -> rrot2 -> rrot3 -> rrot4 -> dual
+
