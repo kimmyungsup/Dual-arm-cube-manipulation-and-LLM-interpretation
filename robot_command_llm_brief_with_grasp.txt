@@ -75,6 +75,7 @@ Meaning:
   "motion <motion_name_or_alias>"
 - These commands execute one row from custom_motion.csv.
 - The CSV row may be arm-only, hand-only, or both depending on motion_use_arm and motion_use_hand.
+- New column `require` can list prerequisite motion aliases/names. If `require` is empty, the motion is allowed after any prior motion.
 
 Custom motion registry maintained by the user
 - Add your custom motions below manually after recording/editing custom_motion.csv.
@@ -82,16 +83,16 @@ Custom motion registry maintained by the user
   - alias: <alias>, name: <motion_name>, command: "motion <alias>", type: <arm_only|hand_only|arm_hand>, description: <short natural-language meaning>
 
 BEGIN_CUSTOM_MOTIONS
-- alias: lpg, name: left_pre_grasp, command: "motion lpg", type: arm_only, description: 왼팔만 기존 left_grasp 접근 위치로 이동하고 손은 현재 상태를 유지한다.
-- alias: lgp, name: left_grasp_pose, command: "motion lgp", type: arm_hand, description: 왼팔 접근 위치와 왼손 파지 pose를 함께 적용한다.
-- alias: llift, name: left_lift_pose, command: "motion llift", type: arm_only, description: 왼손 파지 상태를 유지한 채 왼팔만 약 8cm 들어올린다.
-- alias: lrot, name: left_rotate_pose, command: "motion lrot", type: arm_only, description: 왼팔로 큐브를 회전/재지향하는 pose를 적용한다.
-- alias: lrelp, name: left_release_pose, command: "motion lrelp", type: hand_only, description: 왼손만 ready 손 target으로 복귀해 release/open한다.
-- alias: rpg, name: right_pre_grasp, command: "motion rpg", type: arm_only, description: 오른팔만 좌우 반전 접근 위치로 이동하고 손은 현재 상태를 유지한다.
-- alias: rgp, name: right_grasp_pose, command: "motion rgp", type: arm_hand, description: 오른팔 접근 위치와 오른손 파지 pose를 함께 적용한다.
-- alias: rrot, name: right_rotate_pose, command: "motion rrot", type: arm_only, description: 오른팔로 큐브를 회전/재지향하는 pose를 적용한다.
-- alias: cshow, name: cube_show_to_camera, command: "motion cshow", type: arm_only, description: CubeNet 촬영을 위해 큐브를 카메라에 보여주는 pose를 적용한다.
-- alias: cl2r, name: cube_transfer_left_to_right, command: "motion cl2r", type: arm_hand, description: 왼손 파지 위치와 오른손 수신 위치를 함께 구성하는 좌->우 전달 중간 pose를 적용한다.
+- alias: lpg, name: left_pre_grasp, command: "motion lpg", type: arm_only, description: Move only the left arm to the pre-grasp approach pose while keeping current hand posture.; require: any
+- alias: lgp, name: left_grasp_pose, command: "motion lgp", type: arm_hand, description: Apply the left-arm approach pose together with the left-hand grasp posture.; require: any
+- alias: llift, name: left_lift_pose, command: "motion llift", type: arm_only, description: Keep the left-hand grasp state and lift only the left arm upward by about 8 cm.; require: any
+- alias: lrot, name: left_rotate_pose, command: "motion lrot", type: arm_only, description: Apply the left-arm cube reorientation/rotation pose.; require: any
+- alias: lrelp, name: left_release_pose, command: "motion lrelp", type: hand_only, description: Return only the left hand to the ready-hand target (left-hand release pose).; require: any
+- alias: rpg, name: right_pre_grasp, command: "motion rpg", type: arm_only, description: Move only the right arm to the mirrored pre-grasp approach pose while keeping current hand posture.; require: any
+- alias: rgp, name: right_grasp_pose, command: "motion rgp", type: arm_hand, description: Apply the mirrored right-arm approach pose together with the right-hand grasp posture.; require: any
+- alias: rrot, name: right_rotate_pose, command: "motion rrot", type: arm_only, description: Apply the right-arm cube reorientation/rotation pose.; require: any
+- alias: cshow, name: cube_show_to_camera, command: "motion cshow", type: arm_only, description: Move to a camera-facing cube presentation pose for CubeNet capture (seed pose; tune on real robot).; require: any
+- alias: cl2r, name: cube_transfer_left_to_right, command: "motion cl2r", type: arm_hand, description: Apply a left-to-right handoff intermediate pose with left hold and right receive posture (tune spacing on real robot).; require: any
 END_CUSTOM_MOTIONS
 
 6) Dual-hand joint command
@@ -101,6 +102,7 @@ END_CUSTOM_MOTIONS
 
 Priority rules
 - If the request is about normal grasping/releasing/extending/opening, ALWAYS use lg/lr/le/rg/rr/re.
+- When selecting custom motions, respect each motion's `require` field. If `require` is not empty, schedule that motion only after one of its prerequisite aliases/names.
 - Use distal grasp preset commands only when the user explicitly asks for distal-only or fingertip-specific grasping.
 - Do NOT generate joint arrays when lg/lr/le/rg/rr/re, a custom motion, or a grasp preset can be used.
 - If the user request matches a custom motion listed in BEGIN_CUSTOM_MOTIONS, output its "motion <alias>" command.

@@ -284,10 +284,12 @@ CUSTOM_MOTION_METADATA_COLUMNS = [
     "motion_use_arm",
     "motion_use_hand",
     "motion_tags",
+    "require",
 ]
 
 # Scenario mode state.
 scenario_step_counter = 1
+last_executed_motion_identifier = ""
 
 # Finger mapping assumption.
 # 20 hand joints are grouped as 5 fingers x 4 joints.
@@ -1019,6 +1021,7 @@ def build_custom_motion_record(record: dict, label: str = ""):
         "motion_use_arm": "TRUE",
         "motion_use_hand": "TRUE",
         "motion_tags": "",
+        "require": "",
     }
     custom_record.update(record)
     return custom_record
@@ -1095,8 +1098,28 @@ def set_hand_from_snapshot_row(row):
     right_hand_target = np.array([float(row[f"right_hand_target_j{i}"]) for i in range(1, 21)], dtype=np.float32)
 
 
+def _parse_motion_requirements(require_value: str):
+    """Parse custom-motion `require` cell into a list of prerequisite motion identifiers."""
+    raw = str(require_value or "").strip()
+    if not raw:
+        return []
+    normalized = raw.replace(';', ',').replace('/', ',').replace('|', ',')
+    return [token.strip() for token in normalized.split(',') if token.strip()]
+
+
+def _motion_identifier_candidates(row: dict, identifier: str):
+    return [
+        str(identifier or "").strip(),
+        str(row.get("motion_alias", "")).strip(),
+        str(row.get("motion_name", "")).strip(),
+        str(row.get("label", "")).strip(),
+    ]
+
+
 def run_custom_motion(sock, identifier: str, verbose: bool = True, speed_scale: float = DEFAULT_SPEED_SCALE):
     """Run one editable custom motion by motion_name, motion_alias, or label."""
+    global last_executed_motion_identifier
+
     row = load_custom_motion_row(identifier)
     if row is None:
         print(f"[ERR] custom motion not found: {identifier}")
@@ -1106,10 +1129,26 @@ def run_custom_motion(sock, identifier: str, verbose: bool = True, speed_scale: 
     use_hand = _csv_bool(row.get("motion_use_hand"), default=True)
     motion_name = row.get("motion_name") or row.get("label") or identifier
     motion_alias = row.get("motion_alias", "")
+    require_tokens = _parse_motion_requirements(row.get("require", ""))
+
+    if require_tokens:
+        previous_id = (last_executed_motion_identifier or "").strip()
+        if previous_id and previous_id in require_tokens:
+            pass
+        else:
+            print(
+                f"[WARN] custom motion '{motion_name}' requires previous motion in {require_tokens}, "
+                f"but previous was '{previous_id or 'N/A'}'"
+            )
+            return False
 
     if verbose:
         alias_text = f" alias={motion_alias}" if motion_alias else ""
-        print(f"[CUSTOM] running motion '{motion_name}'{alias_text} use_arm={use_arm} use_hand={use_hand}")
+        require_text = ",".join(require_tokens) if require_tokens else "any"
+        print(
+            f"[CUSTOM] running motion '{motion_name}'{alias_text} "
+            f"use_arm={use_arm} use_hand={use_hand} require={require_text}"
+        )
 
     if use_arm:
         set_task_from_snapshot_row(row)
@@ -1121,6 +1160,12 @@ def run_custom_motion(sock, identifier: str, verbose: bool = True, speed_scale: 
         scaled_sleep(0.02, speed_scale)
     if not use_arm and not use_hand:
         print(f"[WARN] custom motion '{motion_name}' has both motion_use_arm and motion_use_hand disabled")
+
+    candidates = _motion_identifier_candidates(row, identifier)
+    for candidate in candidates:
+        if candidate:
+            last_executed_motion_identifier = candidate
+            break
     return True
 
 
@@ -2143,6 +2188,14 @@ def capture_chat_camera_image(image_path: str = CHAT_CAM_IMAGE_PATH):
         image_b64 = base64.b64encode(encoded.tobytes()).decode('utf-8')
         print(f"[CHAT][CAM] captured image saved: {image_path}")
         print(f"[CHAT][CAM] preview window: {CHAT_CAM_PREVIEW_WINDOW}")
+        print("[CHAT][CAM] close the preview window (or press q/ESC in the window) to continue.")
+
+        while cv2.getWindowProperty(CHAT_CAM_PREVIEW_WINDOW, cv2.WND_PROP_VISIBLE) >= 1:
+            key = cv2.waitKey(50) & 0xFF
+            if key in (27, ord('q')):
+                cv2.destroyWindow(CHAT_CAM_PREVIEW_WINDOW)
+                break
+
         return image_b64, image_path
     finally:
         pipeline.stop()
@@ -2907,7 +2960,7 @@ def print_help():
 
   record [label]
       Save current scenario snapshot to TXT/CSV and custom_motion.csv
-      Edit custom_motion.csv columns: motion_name, motion_alias, motion_description, motion_use_arm, motion_use_hand
+      Edit custom_motion.csv columns: motion_name, motion_alias, motion_description, motion_use_arm, motion_use_hand, motion_tags, require
 
   scenarioexample
       Print current task/hand command example block
