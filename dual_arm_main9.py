@@ -1241,36 +1241,35 @@ def load_ready_state_from_csv(path: str = READY_CSV_PATH):
     }
 
 
-def apply_ready_state(state: dict):
-    """Apply a previously loaded ready state to current task/hand targets."""
+def apply_ready_state(state: dict, apply_hand: bool = True):
+    """Apply a previously loaded ready state to current task targets (and optionally hand targets)."""
     global left_task, right_task, left_hand_target, right_hand_target
     left_task = state["left_task"].copy()
     right_task = state["right_task"].copy()
-    left_hand_target = state["left_hand_target"].copy()
-    right_hand_target = state["right_hand_target"].copy()
+    if apply_hand:
+        left_hand_target = state["left_hand_target"].copy()
+        right_hand_target = state["right_hand_target"].copy()
 
 
 def send_ready_from_csv(sock, path: str = READY_CSV_PATH, verbose: bool = True, speed_scale: float = DEFAULT_SPEED_SCALE):
     """
     Load the latest state from scenario_records.csv and send it as a ready pose.
 
-    Behavior:
+    Behavior (default):
     - update both arm task targets
-    - update both hand targets
-    - send task command
-    - send hand command
+    - keep current hand targets unchanged
+    - send task command only
     """
     state = load_ready_state_from_csv(path)
     if state is None:
         return False
 
-    apply_ready_state(state)
+    apply_ready_state(state, apply_hand=False)
 
     if verbose:
-        print(f"[INFO] ready pose loaded from: {path}")
+        print(f"[INFO] ready pose loaded from: {path} (arm-only; hand targets preserved)")
 
     send_current_task(sock, verbose=verbose)
-    send_current_hand(sock, verbose=verbose)
 
 # =============================================================================
 # Scenario command example exporters
@@ -2059,7 +2058,7 @@ def dispatch_robot_command_sequence(
 def dispatch_robot_command(sock, cmd: str, verbose: bool = True, speed_scale: float = DEFAULT_SPEED_SCALE):
     """
     Dispatch one validated robot command immediately.
-    - ready: load CSV state and send task + hand
+    - ready: load CSV state and send task only (preserve hand targets)
     - task: update local state and send task
     - hand: update local state and send hand
     - lg/lr/le/rg/rr/re: ready-based hand-only grasp/release/extend
@@ -2885,7 +2884,7 @@ def print_help():
 
   init / rest / home / ready / quit
       Send system motion commands
-      ready [speed_scale] loads the latest pose from scenario_records.csv and sends task+hand
+      ready [speed_scale] loads the latest pose from scenario_records.csv and sends task only (hand preserved)
 
   show
       Print labeled current feedback v data
