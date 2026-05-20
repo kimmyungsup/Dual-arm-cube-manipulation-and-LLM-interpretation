@@ -98,6 +98,17 @@ BEGIN_CUSTOM_MOTIONS
 - alias: rrot3, name: right_twist3, command: "motion rrot3", type: arm_only, description: Recovery step 2 after right twist.; require: any
 - alias: grl, name: grasp_rotate_left, command: "motion grl", type: arm_only, description: Rotate object on the ground using left hand grasp state.; require: any
 - alias: grl2, name: grasp_rotate_left2, command: "motion grl2", type: arm_only, description: Recovery pose after grasp_rotate_left.; require: any
+- alias: grasp_top, name: grasp_top_ready, command: "motion grasp_top", type: arm_only, description: Move to top-layer grasp-ready pose.; require: any
+- alias: rotate_top_cc, name: rotate_top_cc, command: "motion rotate_top_cc", type: arm_only, description: Rotate top layer counter-clockwise.; require: any
+- alias: rotate_top_clock, name: rotate_top_clock, command: "motion rotate_top_clock", type: arm_only, description: Rotate top layer clockwise.; require: any
+- alias: grasp_bottom, name: grasp_bottom_ready, command: "motion grasp_bottom", type: arm_only, description: Move to bottom-layer grasp-ready pose.; require: any
+- alias: rotate_bt_clock, name: rotate_bt_clock, command: "motion rotate_bt_clock", type: arm_only, description: Rotate bottom layer clockwise.; require: any
+- alias: rotate_bottom_cc, name: rotate_bottom_cc, command: "motion rotate_bottom_cc", type: arm_only, description: Rotate bottom layer counter-clockwise.; require: any
+- alias: check_b, name: check_back, command: "motion check_b", type: arm_only, description: Reorient cube for back-face camera check.; require: any
+- alias: check_l, name: check_left, command: "motion check_l", type: arm_only, description: Reorient cube for left-face camera check.; require: any
+- alias: check_r, name: check_right, command: "motion check_r", type: arm_only, description: Reorient cube for right-face camera check.; require: any
+- alias: check_u, name: check_up, command: "motion check_u", type: arm_only, description: Reorient cube for up-face camera check.; require: any
+- alias: check_d, name: check_down, command: "motion check_d", type: arm_only, description: Reorient cube for down-face camera check.; require: any
 END_CUSTOM_MOTIONS
 
 6) Dual-hand joint command

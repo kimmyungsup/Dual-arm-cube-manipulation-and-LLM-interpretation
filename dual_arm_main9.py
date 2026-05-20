@@ -1759,38 +1759,15 @@ def print_current_summary_for_scenario():
 
 def scenario_mode(sock):
     """Keyboard mode for scenario authoring and command example export."""
-    face_scan_order = ["U", "R", "F", "D", "L", "B"]
-    # Fixed in-code transition plan so observed face order is deterministic.
-    # Each transition executes a custom-motion chain that reorients the cube
-    # from the currently recognized face toward the next target face.
-    face_transition_plan = {
-        "U": {
-            "next_face": "R",
-            "rotation_desc": "Rotate right side toward camera (right twist + recover).",
-            "motions": ["dual", "rrot", "rr", "rrot2", "rrot3", "rrot4", "dual"],
-        },
-        "R": {
-            "next_face": "F",
-            "rotation_desc": "Rotate left side toward camera (left twist + re-grasp).",
-            "motions": ["dual", "lrot", "lr", "lrot2", "lrot3", "dual", "lg"],
-        },
-        "F": {
-            "next_face": "D",
-            "rotation_desc": "Ground-style clockwise 90° left-hand rotation.",
-            "motions": ["pick_ready", "pick_left", "lg", "grl", "lr", "grl2", "return"],
-        },
-        "D": {
-            "next_face": "L",
-            "rotation_desc": "Mirror via dual hold and right-side twist transition.",
-            "motions": ["dual", "rrot", "rr", "rrot2", "rrot3", "rrot4", "dual"],
-        },
-        "L": {
-            "next_face": "B",
-            "rotation_desc": "Final side transition using left twist chain.",
-            "motions": ["dual", "lrot", "lr", "lrot2", "lrot3", "dual", "lg"],
-        },
+    face_scan_order = ["F", "B", "L", "R", "U", "D"]
+    face_view_motion = {
+        "F": {"motion": "dual", "desc": "front face check"},
+        "B": {"motion": "check_b", "desc": "back face check"},
+        "L": {"motion": "check_l", "desc": "left face check"},
+        "R": {"motion": "check_r", "desc": "right face check"},
+        "U": {"motion": "check_u", "desc": "up face check"},
+        "D": {"motion": "check_d", "desc": "down face check"},
     }
-    face_rotation_state = {"last_face": None}
 
     def on_face_registered(face_idx, face_name, color_names, progress, total_faces, face_position=None):
         if face_position is not None:
@@ -1813,32 +1790,45 @@ def scenario_mode(sock):
                 "Rotation plan still follows fixed order."
             )
 
+        view_plan = face_view_motion.get(expected_face)
+        if view_plan:
+            print(
+                f"[SCENARIO][CUBENET] face-view action: {view_plan['desc']} -> motion {view_plan['motion']}"
+            )
+            ok = run_cube_custom_motion(
+                sock,
+                view_plan["motion"],
+                row_delay=1.0,
+                speed_scale=DEFAULT_SPEED_SCALE,
+            )
+            if not ok:
+                print("[SCENARIO][CUBENET][ERR] face-view motion failed.")
+                return
+
         if int(progress) >= int(total_faces):
             print("[SCENARIO][CUBENET] all faces acquired; no further rotation needed.")
             return
 
-        plan = face_transition_plan.get(expected_face)
-        if not plan:
-            print(f"[SCENARIO][CUBENET][WARN] no transition plan for face {expected_face}; waiting for next capture.")
+        next_face = face_scan_order[expected_idx + 1]
+        next_plan = face_view_motion.get(next_face)
+        if not next_plan:
+            print(f"[SCENARIO][CUBENET][WARN] no next-face plan for {next_face}.")
             return
-
         print(
-            "[SCENARIO][CUBENET] next target face: "
-            f"{plan['next_face']} | rotation: {plan['rotation_desc']}"
+            f"[SCENARIO][CUBENET] next target face: {next_face} | "
+            f"rotation/view motion: {next_plan['motion']}"
         )
-        print(f"[SCENARIO][CUBENET] motion chain: {' -> '.join(plan['motions'])}")
-        ok = run_cube_custom_motion_sequence(
+        ok = run_cube_custom_motion(
             sock,
-            plan["motions"],
+            next_plan["motion"],
             row_delay=1.0,
             speed_scale=DEFAULT_SPEED_SCALE,
         )
         if not ok:
-            print("[SCENARIO][CUBENET][ERR] auto-rotation chain failed; operator intervention may be required.")
+            print("[SCENARIO][CUBENET][ERR] next-face transition motion failed; operator intervention may be required.")
             return
-        face_rotation_state["last_face"] = expected_face
         print(
-            f"[SCENARIO][CUBENET] rotation complete. Please present face {plan['next_face']} to the camera."
+            f"[SCENARIO][CUBENET] transition complete. Please present face {next_face} to the camera."
         )
 
     def on_capture_completed(face_data_map, solution):
