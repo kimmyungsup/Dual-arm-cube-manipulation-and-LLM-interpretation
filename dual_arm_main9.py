@@ -1759,6 +1759,39 @@ def print_current_summary_for_scenario():
 
 def scenario_mode(sock):
     """Keyboard mode for scenario authoring and command example export."""
+    face_scan_order = ["U", "R", "F", "D", "L", "B"]
+    # Fixed in-code transition plan so observed face order is deterministic.
+    # Each transition executes a custom-motion chain that reorients the cube
+    # from the currently recognized face toward the next target face.
+    face_transition_plan = {
+        "U": {
+            "next_face": "R",
+            "rotation_desc": "Rotate right side toward camera (right twist + recover).",
+            "motions": ["dual", "rrot", "rr", "rrot2", "rrot3", "rrot4", "dual"],
+        },
+        "R": {
+            "next_face": "F",
+            "rotation_desc": "Rotate left side toward camera (left twist + re-grasp).",
+            "motions": ["dual", "lrot", "lr", "lrot2", "lrot3", "dual", "lg"],
+        },
+        "F": {
+            "next_face": "D",
+            "rotation_desc": "Ground-style clockwise 90° left-hand rotation.",
+            "motions": ["pick_ready", "pick_left", "lg", "grl", "lr", "grl2", "return"],
+        },
+        "D": {
+            "next_face": "L",
+            "rotation_desc": "Mirror via dual hold and right-side twist transition.",
+            "motions": ["dual", "rrot", "rr", "rrot2", "rrot3", "rrot4", "dual"],
+        },
+        "L": {
+            "next_face": "B",
+            "rotation_desc": "Final side transition using left twist chain.",
+            "motions": ["dual", "lrot", "lr", "lrot2", "lrot3", "dual", "lg"],
+        },
+    }
+    face_rotation_state = {"last_face": None}
+
     def on_face_registered(face_idx, face_name, color_names, progress, total_faces, face_position=None):
         if face_position is not None:
             store_cubenet_face_position(face_position)
@@ -1768,9 +1801,45 @@ def scenario_mode(sock):
         )
         if face_position is not None:
             print(f"[SCENARIO][CUBENET] stored face position: {format_cubenet_face_position(face_position)}")
-        print("[SCENARIO][CUBENET] running inter-face test grasp motions...")
-        run_named_grasp_preset(sock, "left_grasp_off", verbose=True, speed_scale=DEFAULT_SPEED_SCALE)
-        run_named_grasp_preset(sock, "right_grasp_on", verbose=True, speed_scale=DEFAULT_SPEED_SCALE)
+        expected_idx = min(max(int(progress) - 1, 0), len(face_scan_order) - 1)
+        expected_face = face_scan_order[expected_idx]
+        print(
+            f"[SCENARIO][CUBENET] fixed scan order: {' -> '.join(face_scan_order)} | "
+            f"expected now: {expected_face}"
+        )
+        if face_name != expected_face:
+            print(
+                f"[SCENARIO][CUBENET][WARN] observed face={face_name}, but fixed order expects {expected_face}. "
+                "Rotation plan still follows fixed order."
+            )
+
+        if int(progress) >= int(total_faces):
+            print("[SCENARIO][CUBENET] all faces acquired; no further rotation needed.")
+            return
+
+        plan = face_transition_plan.get(expected_face)
+        if not plan:
+            print(f"[SCENARIO][CUBENET][WARN] no transition plan for face {expected_face}; waiting for next capture.")
+            return
+
+        print(
+            "[SCENARIO][CUBENET] next target face: "
+            f"{plan['next_face']} | rotation: {plan['rotation_desc']}"
+        )
+        print(f"[SCENARIO][CUBENET] motion chain: {' -> '.join(plan['motions'])}")
+        ok = run_cube_custom_motion_sequence(
+            sock,
+            plan["motions"],
+            row_delay=1.0,
+            speed_scale=DEFAULT_SPEED_SCALE,
+        )
+        if not ok:
+            print("[SCENARIO][CUBENET][ERR] auto-rotation chain failed; operator intervention may be required.")
+            return
+        face_rotation_state["last_face"] = expected_face
+        print(
+            f"[SCENARIO][CUBENET] rotation complete. Please present face {plan['next_face']} to the camera."
+        )
 
     def on_capture_completed(face_data_map, solution):
         print("\n[SCENARIO][CUBENET] all 6 faces captured.")
