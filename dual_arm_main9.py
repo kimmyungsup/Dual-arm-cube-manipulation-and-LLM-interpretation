@@ -1241,36 +1241,35 @@ def load_ready_state_from_csv(path: str = READY_CSV_PATH):
     }
 
 
-def apply_ready_state(state: dict):
-    """Apply a previously loaded ready state to current task/hand targets."""
+def apply_ready_state(state: dict, apply_hand: bool = True):
+    """Apply a previously loaded ready state to current task targets (and optionally hand targets)."""
     global left_task, right_task, left_hand_target, right_hand_target
     left_task = state["left_task"].copy()
     right_task = state["right_task"].copy()
-    left_hand_target = state["left_hand_target"].copy()
-    right_hand_target = state["right_hand_target"].copy()
+    if apply_hand:
+        left_hand_target = state["left_hand_target"].copy()
+        right_hand_target = state["right_hand_target"].copy()
 
 
 def send_ready_from_csv(sock, path: str = READY_CSV_PATH, verbose: bool = True, speed_scale: float = DEFAULT_SPEED_SCALE):
     """
     Load the latest state from scenario_records.csv and send it as a ready pose.
 
-    Behavior:
+    Behavior (default):
     - update both arm task targets
-    - update both hand targets
-    - send task command
-    - send hand command
+    - keep current hand targets unchanged
+    - send task command only
     """
     state = load_ready_state_from_csv(path)
     if state is None:
         return False
 
-    apply_ready_state(state)
+    apply_ready_state(state, apply_hand=False)
 
     if verbose:
-        print(f"[INFO] ready pose loaded from: {path}")
+        print(f"[INFO] ready pose loaded from: {path} (arm-only; hand targets preserved)")
 
     send_current_task(sock, verbose=verbose)
-    send_current_hand(sock, verbose=verbose)
 
 # =============================================================================
 # Scenario command example exporters
@@ -1760,6 +1759,16 @@ def print_current_summary_for_scenario():
 
 def scenario_mode(sock):
     """Keyboard mode for scenario authoring and command example export."""
+    face_scan_order = ["F", "B", "L", "R", "U", "D"]
+    face_view_motion = {
+        "F": {"motion": "dual", "desc": "front face check"},
+        "B": {"motion": "check_b", "desc": "back face check"},
+        "L": {"motion": "check_l", "desc": "left face check"},
+        "R": {"motion": "check_r", "desc": "right face check"},
+        "U": {"motion": "check_u", "desc": "up face check"},
+        "D": {"motion": "check_d", "desc": "down face check"},
+    }
+
     def on_face_registered(face_idx, face_name, color_names, progress, total_faces, face_position=None):
         if face_position is not None:
             store_cubenet_face_position(face_position)
@@ -1769,9 +1778,58 @@ def scenario_mode(sock):
         )
         if face_position is not None:
             print(f"[SCENARIO][CUBENET] stored face position: {format_cubenet_face_position(face_position)}")
-        print("[SCENARIO][CUBENET] running inter-face test grasp motions...")
-        run_named_grasp_preset(sock, "left_grasp_off", verbose=True, speed_scale=DEFAULT_SPEED_SCALE)
-        run_named_grasp_preset(sock, "right_grasp_on", verbose=True, speed_scale=DEFAULT_SPEED_SCALE)
+        expected_idx = min(max(int(progress) - 1, 0), len(face_scan_order) - 1)
+        expected_face = face_scan_order[expected_idx]
+        print(
+            f"[SCENARIO][CUBENET] fixed scan order: {' -> '.join(face_scan_order)} | "
+            f"expected now: {expected_face}"
+        )
+        if face_name != expected_face:
+            print(
+                f"[SCENARIO][CUBENET][WARN] observed face={face_name}, but fixed order expects {expected_face}. "
+                "Rotation plan still follows fixed order."
+            )
+
+        view_plan = face_view_motion.get(expected_face)
+        if view_plan:
+            print(
+                f"[SCENARIO][CUBENET] face-view action: {view_plan['desc']} -> motion {view_plan['motion']}"
+            )
+            ok = run_cube_custom_motion(
+                sock,
+                view_plan["motion"],
+                row_delay=1.0,
+                speed_scale=DEFAULT_SPEED_SCALE,
+            )
+            if not ok:
+                print("[SCENARIO][CUBENET][ERR] face-view motion failed.")
+                return
+
+        if int(progress) >= int(total_faces):
+            print("[SCENARIO][CUBENET] all faces acquired; no further rotation needed.")
+            return
+
+        next_face = face_scan_order[expected_idx + 1]
+        next_plan = face_view_motion.get(next_face)
+        if not next_plan:
+            print(f"[SCENARIO][CUBENET][WARN] no next-face plan for {next_face}.")
+            return
+        print(
+            f"[SCENARIO][CUBENET] next target face: {next_face} | "
+            f"rotation/view motion: {next_plan['motion']}"
+        )
+        ok = run_cube_custom_motion(
+            sock,
+            next_plan["motion"],
+            row_delay=1.0,
+            speed_scale=DEFAULT_SPEED_SCALE,
+        )
+        if not ok:
+            print("[SCENARIO][CUBENET][ERR] next-face transition motion failed; operator intervention may be required.")
+            return
+        print(
+            f"[SCENARIO][CUBENET] transition complete. Please present face {next_face} to the camera."
+        )
 
     def on_capture_completed(face_data_map, solution):
         print("\n[SCENARIO][CUBENET] all 6 faces captured.")
@@ -2059,7 +2117,7 @@ def dispatch_robot_command_sequence(
 def dispatch_robot_command(sock, cmd: str, verbose: bool = True, speed_scale: float = DEFAULT_SPEED_SCALE):
     """
     Dispatch one validated robot command immediately.
-    - ready: load CSV state and send task + hand
+    - ready: load CSV state and send task only (preserve hand targets)
     - task: update local state and send task
     - hand: update local state and send hand
     - lg/lr/le/rg/rr/re: ready-based hand-only grasp/release/extend
@@ -2885,7 +2943,7 @@ def print_help():
 
   init / rest / home / ready / quit
       Send system motion commands
-      ready [speed_scale] loads the latest pose from scenario_records.csv and sends task+hand
+      ready [speed_scale] loads the latest pose from scenario_records.csv and sends task only (hand preserved)
 
   show
       Print labeled current feedback v data
