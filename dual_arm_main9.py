@@ -16,6 +16,10 @@ import tempfile
 
 import numpy as np
 import pandas as pd
+try:
+    import zmq
+except Exception:
+    zmq = None
 
 # =============================================================================
 # Optional CubeNet integration
@@ -246,6 +250,9 @@ XMODE_UDP_HOST = "192.168.0.2"
 
 RCV_ADDR = (DEFAULT_UDP_HOST, 6601)
 SRV_ADDR = (DEFAULT_UDP_HOST, 6600)
+TRANSPORT_MODE = "udp"
+ZMQ_CMD_ENDPOINT = f"tcp://{DEFAULT_UDP_HOST}:6600"
+ZMQ_FEEDBACK_ENDPOINT = f"tcp://{DEFAULT_UDP_HOST}:6601"
 
 # Task-space teleoperation step sizes.
 pos_step = 0.01   # [m]
@@ -314,12 +321,28 @@ FINGER_ORDER = tuple(FINGER_SELECT_KEYS.values())
 # Motion feedback receiver
 # =============================================================================
 def motion_recv_task():
-    """Background thread: receive motion feedback from UDP 6601."""
+    """Background thread: receive motion feedback from UDP or ZeroMQ."""
     global v
+    if TRANSPORT_MODE == "zmq":
+        if zmq is None:
+            print("[ERR] pyzmq is not installed; cannot use ZeroMQ feedback transport.")
+            return
+        ctx = zmq.Context.instance()
+        rcv_sock = ctx.socket(zmq.SUB)
+        rcv_sock.connect(ZMQ_FEEDBACK_ENDPOINT)
+        rcv_sock.setsockopt(zmq.SUBSCRIBE, b"")
+        while True:
+            data = rcv_sock.recv()
+            new_v = np.frombuffer(data, dtype=np.float32)
+            if new_v.size != MOTION_FEEDBACK_SIZE:
+                print(f"[WARN] unexpected motion data size: {new_v.size} (expected {MOTION_FEEDBACK_SIZE})")
+                continue
+            with v_lock:
+                v = new_v.copy()
+        return
 
     rcv_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     rcv_sock.bind(RCV_ADDR)
-
     while True:
         data, _ = rcv_sock.recvfrom(2048)
         new_v = np.frombuffer(data, dtype=np.float32)
@@ -370,7 +393,10 @@ def set_sequence_command_delay(delay_sec: float):
 
 def send_cmd(sock, cmd: str, verbose: bool = True):
     """Send a raw command string to the slave controller."""
-    sock.sendto(cmd.encode(), SRV_ADDR)
+    if TRANSPORT_MODE == "zmq":
+        sock.send_string(cmd)
+    else:
+        sock.sendto(cmd.encode(), SRV_ADDR)
     if verbose:
         print(f"[TX] {cmd}")
 
@@ -3090,16 +3116,29 @@ def parse_launch_args():
         dest="x_mode",
         help="use 192.168.0.2 instead of 127.0.0.1 for UDP addresses",
     )
+    parser.add_argument(
+        "-zmq",
+        action="store_true",
+        dest="zmq_mode",
+        help="use ZeroMQ transport for local mode",
+    )
     return parser.parse_args()
 
 
 def configure_udp_addresses_from_args(args):
-    """Set global UDP addresses from parsed launch arguments."""
-    global RCV_ADDR, SRV_ADDR
+    """Set global transport addresses/endpoints from parsed launch arguments."""
+    global RCV_ADDR, SRV_ADDR, TRANSPORT_MODE, ZMQ_CMD_ENDPOINT, ZMQ_FEEDBACK_ENDPOINT
 
     host = XMODE_UDP_HOST if args.x_mode else DEFAULT_UDP_HOST
+    # Requested behavior:
+    # - default run               -> UDP local
+    # - -zmq                      -> ZeroMQ local
+    # - -x                        -> ZeroMQ remote
+    TRANSPORT_MODE = "zmq" if (args.x_mode or args.zmq_mode) else "udp"
     RCV_ADDR = (host, 6601)
     SRV_ADDR = (host, 6600)
+    ZMQ_CMD_ENDPOINT = f"tcp://{host}:6600"
+    ZMQ_FEEDBACK_ENDPOINT = f"tcp://{host}:6601"
 
 
 # =============================================================================
@@ -3112,12 +3151,25 @@ def main():
     receiver_thread = threading.Thread(target=motion_recv_task, daemon=True)
     receiver_thread.start()
 
-    snd_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    if TRANSPORT_MODE == "zmq":
+        if zmq is None:
+            print("[ERR] --transport zmq selected but pyzmq is not installed.")
+            return
+        ctx = zmq.Context.instance()
+        snd_sock = ctx.socket(zmq.PUB)
+        snd_sock.connect(ZMQ_CMD_ENDPOINT)
+        time.sleep(0.1)
+    else:
+        snd_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 
     print("[INFO] motion receive thread started")
     print("[INFO] dual-arm keyboard controller started")
+    print(f"[INFO] transport mode          : {TRANSPORT_MODE}")
     print(f"[INFO] RCV_ADDR                : {RCV_ADDR}")
     print(f"[INFO] SRV_ADDR                : {SRV_ADDR}")
+    if TRANSPORT_MODE == "zmq":
+        print(f"[INFO] ZMQ feedback endpoint   : {ZMQ_FEEDBACK_ENDPOINT}")
+        print(f"[INFO] ZMQ command endpoint    : {ZMQ_CMD_ENDPOINT}")
     print(f"[INFO] CubeNet detector model   : {CUBENET_DETECTOR_PATH}")
     print(f"[INFO] CubeNet classifier model : {CUBENET_CLASSIFIER_PATH}")
     print(f"[INFO] LLM spec path            : {LLM_SPEC_PATH}")
