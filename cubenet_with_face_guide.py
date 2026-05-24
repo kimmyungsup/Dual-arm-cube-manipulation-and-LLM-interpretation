@@ -259,6 +259,31 @@ def _notify_face_registered(
         print(f"[WARN] on_face_registered callback error: {callback_error}")
 
 
+def run_camera_only_mode() -> None:
+    """Show realtime webcam frames only (no cube detection/recognition)."""
+    print("[CUBENET][CAM_ONLY] starting webcam...")
+    webcam = WebcamInteractor()
+    print("[CUBENET][CAM_ONLY] live camera mode started (cube detection disabled)")
+
+    while True:
+        frame, _depth = webcam.get_frame()
+        if frame is None:
+            continue
+        frame = color_preprocess(frame)
+        cv2.putText(
+            frame,
+            "CAM_ONLY MODE: live camera preview (cube recognition disabled)",
+            (20, 30),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.6,
+            (0, 255, 255),
+            2,
+            cv2.LINE_AA,
+        )
+        webcam.show_frame(frame)
+        webcam.await_input()
+
+
 def main(detector_path: str, classifier_path: str, on_face_registered=None, on_capture_completed=None) -> None:
     load_started = time.perf_counter()
     print("[CUBENET][LOAD] loading color classifier...")
@@ -456,19 +481,26 @@ def _validate_model_path(path: str, label: str) -> bool:
     return False
 
 
-def run_standalone(detector_path: str = DEFAULT_DETECTOR_PATH, classifier_path: str = DEFAULT_CLASSIFIER_PATH) -> int:
+def run_standalone(
+    detector_path: str = DEFAULT_DETECTOR_PATH,
+    classifier_path: str = DEFAULT_CLASSIFIER_PATH,
+    cam_only: bool = False,
+) -> int:
     """Run the face-guide detector with the same default assets/logs as dual_arm_main9.py v mode."""
     print("[INFO] CubeNet face-guide detection thread started")
     print(f"[INFO] detector_path   = {detector_path}")
     print(f"[INFO] classifier_path = {classifier_path}")
 
-    if not _validate_model_path(detector_path, "detector"):
-        return 1
-    if not _validate_model_path(classifier_path, "classifier"):
-        return 1
-
     try:
-        main(detector_path, classifier_path)
+        if cam_only:
+            print("[INFO] -cam_only enabled: running realtime camera preview only.")
+            run_camera_only_mode()
+        else:
+            if not _validate_model_path(detector_path, "detector"):
+                return 1
+            if not _validate_model_path(classifier_path, "classifier"):
+                return 1
+            main(detector_path, classifier_path)
     except KeyboardInterrupt:
         print("[INFO] CubeNet face-guide interrupted by user")
         return 130
@@ -499,9 +531,14 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=DEFAULT_CLASSIFIER_PATH,
         help=f"KNN color classifier path (default: {DEFAULT_CLASSIFIER_PATH})",
     )
+    parser.add_argument(
+        '-cam_only',
+        action='store_true',
+        help="Run webcam preview only (skip cube detection/recognition).",
+    )
     return parser
 
 
 if __name__ == '__main__':
     args = build_arg_parser().parse_args()
-    raise SystemExit(run_standalone(args.detector_path, args.classifier_path))
+    raise SystemExit(run_standalone(args.detector_path, args.classifier_path, cam_only=args.cam_only))
