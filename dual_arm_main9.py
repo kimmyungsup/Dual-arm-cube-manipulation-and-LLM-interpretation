@@ -2958,6 +2958,44 @@ def run_cube_sequence(sock, speed_scale: float = DEFAULT_SPEED_SCALE, custom_mot
     return True
 
 # =============================================================================
+# Hand pose estimator test mode
+# =============================================================================
+def hand_pose_test_mode(width: int = 640, height: int = 480, fps: int = 30):
+    """Run the standalone RealSense + MediaPipe hand-pose preview loop."""
+    from hand_pose_estimator import HandPoseEstimator
+
+    print("[INFO] entering hand pose estimator test mode...")
+    print("[INFO] RealSense RGB stream will open with MediaPipe hand landmarks overlay.")
+    print("[INFO] Focus the preview window and press ESC or q to return to cmd>.")
+    print(f"[INFO] hand pose stream config: width={width}, height={height}, fps={fps}")
+
+    last_print_time = 0.0
+
+    def on_hand_pose(hand_pose):
+        nonlocal last_print_time
+        now = time.time()
+        if now - last_print_time < 1.0:
+            return
+        last_print_time = now
+        joints = hand_pose.get("joints_2d_px") or []
+        wrist = joints[0] if joints else [0.0, 0.0]
+        print(
+            "[HAND] "
+            f"label={hand_pose.get('hand_label', 'N/A')} "
+            f"score={float(hand_pose.get('score', 0.0)):.3f} "
+            f"joints={len(joints)} "
+            f"wrist_px=({float(wrist[0]):.1f}, {float(wrist[1]):.1f})"
+        )
+
+    estimator = HandPoseEstimator(width=width, height=height, fps=fps)
+    try:
+        estimator.run(on_hand_pose=on_hand_pose, preview=True)
+    finally:
+        estimator.stop()
+    print("[INFO] hand pose estimator test mode exited")
+
+
+# =============================================================================
 # Command-line help text
 # =============================================================================
 def print_help():
@@ -3055,8 +3093,12 @@ def print_help():
   m / teleop
       Enter arm teleop mode
 
-  n / hand
+  n / handteleop
       Enter hand teleop mode
+
+  hand [width height fps]
+      Enter RealSense + MediaPipe hand pose test mode
+      Streams camera preview with recognized hand landmarks overlay
 
   v / scenario
       Enter scenario mode
@@ -3346,10 +3388,20 @@ def main():
                 ok = teleop_mode(snd_sock)
                 if not ok:
                     break
-            elif cmd in ("n", "hand"):
+            elif cmd in ("n", "handteleop"):
                 ok = hand_teleop_mode(snd_sock)
                 if not ok:
                     break
+            elif cmd == "hand":
+                if len(tokens) not in (1, 4):
+                    print("[ERR] hand command format: hand [width height fps]")
+                    continue
+                width, height, fps = 640, 480, 30
+                if len(tokens) == 4:
+                    width = int(tokens[1])
+                    height = int(tokens[2])
+                    fps = int(tokens[3])
+                hand_pose_test_mode(width=width, height=height, fps=fps)
             elif cmd in ("v", "scenario"):
                 ok = scenario_mode(snd_sock)
                 if not ok:
