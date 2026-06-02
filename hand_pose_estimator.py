@@ -1,25 +1,12 @@
-import os
 import time
 import threading
 from dataclasses import dataclass, asdict
 from typing import Callable, Dict, List, Optional, Tuple
 
+import cv2
+import mediapipe as mp
 import numpy as np
-
-try:
-    import cv2
-except Exception:
-    cv2 = None
-
-try:
-    import pyrealsense2 as rs
-except Exception:
-    rs = None
-
-try:
-    import mediapipe as mp
-except Exception:
-    mp = None
+import pyrealsense2 as rs
 
 
 @dataclass
@@ -55,13 +42,6 @@ class HandPoseEstimator:
         min_detection_confidence: float = 0.5,
         min_tracking_confidence: float = 0.5,
     ):
-        if cv2 is None:
-            raise ImportError("opencv-python is required for hand pose estimation.")
-        if rs is None:
-            raise ImportError("pyrealsense2 is required for RealSense input.")
-        if mp is None:
-            raise ImportError("mediapipe is required for hand landmark extraction.")
-
         self.width = width
         self.height = height
         self.fps = fps
@@ -213,7 +193,10 @@ class HandPoseEstimator:
 
                 if preview:
                     cv2.imshow(window_name, frame)
-                    if cv2.waitKey(1) & 0xFF == 27:
+                    key = cv2.waitKey(1) & 0xFF
+                    if key in (27, ord("q")):
+                        break
+                    if cv2.getWindowProperty(window_name, cv2.WND_PROP_VISIBLE) < 1:
                         break
         finally:
             self._running = False
