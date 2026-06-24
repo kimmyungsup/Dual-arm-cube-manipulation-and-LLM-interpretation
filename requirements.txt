@@ -1,12 +1,12 @@
-# Python 3.10 runtime requirements for Dual-arm cube manipulation.
+# Python 3.12-compatible runtime requirements for Dual-arm cube manipulation.
 #
 # Notes:
-# - NumPy is pinned below 2.x because OpenCV/Open3D/TFLite/RealSense wheels
+# - NumPy is pinned below 2.x because OpenCV/Open3D/TensorFlow Lite/RealSense wheels
 #   used by the CubeNet scenario path can fail with NumPy 2.x ABI changes.
 # - opencv-contrib-python is required instead of opencv-python because the code
 #   uses cv2.xphoto.createSimpleWB().
-# - pyrealsense2 and tflite-runtime wheels are platform-specific; install on the
-#   robot/camera host that supports Intel RealSense and TFLite runtime wheels.
+# - pyrealsense2 wheels are platform-specific; install on the robot/camera
+#   host that supports Intel RealSense.
 # - TFLite GPU execution also requires a platform-specific delegate shared
 #   library (for example libtensorflowlite_gpu_delegate.so) available on the host.
 
@@ -23,7 +23,7 @@ pyrealsense2>=2.54,<3
 # Hand pose estimation (MediaPipe Hands)
 # mediapipe wheels bundle required runtime deps (e.g., protobuf/absl).
 mediapipe==0.10.14
-tflite-runtime==2.14.0
+tensorflow>=2.16,<3
 kociemba==1.2.1
 
 # Optional chat/voice-command integrations used by dual_arm_main9.py.
