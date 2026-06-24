@@ -248,11 +248,19 @@ active_finger = "thumb"
 DEFAULT_UDP_HOST = "127.0.0.1"
 XMODE_UDP_HOST = "192.168.0.2"
 
+# ZeroMQ endpoints follow usrsample.py / robot-slave conventions:
+# - local ZeroMQ uses IPC under /dev/shm
+# - remote ZeroMQ uses TCP ports 5555(command PUSH) and 5556(proprio SUB)
+ZMQ_LOCAL_CMD_ENDPOINT = "ipc:///dev/shm/default"
+ZMQ_LOCAL_FEEDBACK_ENDPOINT = "ipc:///dev/shm/proprio"
+ZMQ_REMOTE_CMD_PORT = 5555
+ZMQ_REMOTE_FEEDBACK_PORT = 5556
+
 RCV_ADDR = (DEFAULT_UDP_HOST, 6601)
 SRV_ADDR = (DEFAULT_UDP_HOST, 6600)
 TRANSPORT_MODE = "udp"
-ZMQ_CMD_ENDPOINT = f"tcp://{DEFAULT_UDP_HOST}:6600"
-ZMQ_FEEDBACK_ENDPOINT = f"tcp://{DEFAULT_UDP_HOST}:6601"
+ZMQ_CMD_ENDPOINT = ZMQ_LOCAL_CMD_ENDPOINT
+ZMQ_FEEDBACK_ENDPOINT = ZMQ_LOCAL_FEEDBACK_ENDPOINT
 
 # Task-space teleoperation step sizes.
 pos_step = 0.01   # [m]
@@ -3156,7 +3164,7 @@ def parse_launch_args():
         "-x",
         action="store_true",
         dest="x_mode",
-        help="use 192.168.0.2 instead of 127.0.0.1 for UDP addresses",
+        help="use remote ZeroMQ over TCP to 192.168.0.2",
     )
     parser.add_argument(
         "-zmq",
@@ -3174,13 +3182,18 @@ def configure_udp_addresses_from_args(args):
     host = XMODE_UDP_HOST if args.x_mode else DEFAULT_UDP_HOST
     # Requested behavior:
     # - default run               -> UDP local
-    # - -zmq                      -> ZeroMQ local
-    # - -x                        -> ZeroMQ remote
+    # - -zmq                      -> ZeroMQ local IPC
+    # - -x                        -> ZeroMQ remote TCP
     TRANSPORT_MODE = "zmq" if (args.x_mode or args.zmq_mode) else "udp"
     RCV_ADDR = (host, 6601)
     SRV_ADDR = (host, 6600)
-    ZMQ_CMD_ENDPOINT = f"tcp://{host}:6600"
-    ZMQ_FEEDBACK_ENDPOINT = f"tcp://{host}:6601"
+
+    if args.x_mode:
+        ZMQ_CMD_ENDPOINT = f"tcp://{host}:{ZMQ_REMOTE_CMD_PORT}"
+        ZMQ_FEEDBACK_ENDPOINT = f"tcp://{host}:{ZMQ_REMOTE_FEEDBACK_PORT}"
+    else:
+        ZMQ_CMD_ENDPOINT = ZMQ_LOCAL_CMD_ENDPOINT
+        ZMQ_FEEDBACK_ENDPOINT = ZMQ_LOCAL_FEEDBACK_ENDPOINT
 
 
 # =============================================================================
@@ -3198,9 +3211,8 @@ def main():
             print("[ERR] --transport zmq selected but pyzmq is not installed.")
             return
         ctx = zmq.Context.instance()
-        snd_sock = ctx.socket(zmq.PUB)
+        snd_sock = ctx.socket(zmq.PUSH)
         snd_sock.connect(ZMQ_CMD_ENDPOINT)
-        time.sleep(0.1)
     else:
         snd_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 
